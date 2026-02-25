@@ -1,0 +1,86 @@
+-- name: test_disable_open_rewrite_bug
+-- This test reproduces the crash caused by expr_disable_open_rewrite not traversing _common_sub_expr
+-- The bug: expr_disable_open_rewrite uses children() instead of do_for_each_child(),
+-- so DictMappingExpr in lambda's _common_sub_expr is not disabled for open rewrite.
+-- This causes inconsistent state when dict_func_expr is set but data is binary.
+
+CREATE TABLE IF NOT EXISTS t_disable_rewrite_bug (
+    id INT,
+    grp INT,
+    str1 VARCHAR(100) NOT NULL,
+    str2 VARCHAR(100) NULL,
+    arr_str ARRAY<VARCHAR(100)>,
+    val INT
+) ENGINE=OLAP
+DUPLICATE KEY(id)
+DISTRIBUTED BY HASH(id) BUCKETS 1
+PROPERTIES (
+    "replication_num" = "1"
+);
+
+INSERT INTO t_disable_rewrite_bug VALUES
+    (1, 1, 'apple', 'X', ['a', 'b'], 10),
+    (2, 1, 'banana', 'Y', ['c', 'd'], 20),
+    (3, 1, 'apple', 'Z', ['e', 'f'], 15),
+    (4, 2, 'cherry', 'X', ['g', 'h'], 25),
+    (5, 2, 'banana', 'Y', ['i', 'j'], 30),
+    (6, 2, 'apple', NULL, ['k', 'l'], 35);
+
+[UC] ANALYZE FULL TABLE t_disable_rewrite_bug;
+function: wait_global_dict_ready('str1', 't_disable_rewrite_bug')
+function: wait_global_dict_ready('str2', 't_disable_rewrite_bug')
+
+-- Bug trigger: Lambda function where dict column expression becomes _common_sub_expr
+-- The expression upper(str1) or hash(str1) doesn't depend on lambda argument x,
+-- so it may be extracted to _common_sub_expr by the optimizer.
+-- When expr_disable_open_rewrite misses this, the DictMappingExpr gets rewritten
+-- during open() but then tries to evaluate with binary data.
+
+-- Case 1: array_map with dict column function that becomes common sub-expr
+SELECT id, array_map(x -> concat(x, '-', upper(str1)), arr_str) as result
+FROM t_disable_rewrite_bug ORDER BY id;
+
+-- Case 2: array_map with hash function on dict column (similar to the crash in xx_hash3)
+SELECT id, array_map(x -> concat(x, '-', hex(murmur_hash3_32(str1))), arr_str) as result
+FROM t_disable_rewrite_bug ORDER BY id;
+
+-- Case 3: Multiple dict column references in common sub-expr
+SELECT id, array_map(x -> concat(upper(str1), '-', coalesce(str2, 'N'), '-', x), arr_str) as result
+FROM t_disable_rewrite_bug ORDER BY id;
+
+-- Case 4: Nested lambda with dict column in outer common sub-expr
+SELECT id, array_map(x -> array_map(y -> concat(y, upper(str1)), ['p', 'q']), arr_str) as result
+FROM t_disable_rewrite_bug ORDER BY id;
+
+-- Case 5: array_filter with dict column expression in common sub-expr
+SELECT id, array_filter(x -> length(concat(x, str1)) > 3, arr_str) as result
+FROM t_disable_rewrite_bug ORDER BY id;
+
+-- Case 6: Complex expression that forces common sub-expr extraction
+SELECT id, array_map(x -> concat(x, substring(upper(str1), 1, 2), hex(length(str1))), arr_str) as result
+FROM t_disable_rewrite_bug ORDER BY id;
+
+-- Case 7: With aggregation - dict column in lambda common sub-expr
+SELECT grp, array_sort(array_agg(array_map(x -> concat(x, upper(str1)), arr_str))) as result
+FROM t_disable_rewrite_bug GROUP BY grp ORDER BY grp;
+
+-- Case 8: In projection with multiple lambdas sharing dict column common sub-expr
+SELECT id,
+       array_map(x -> concat(x, upper(str1)), arr_str) as r1,
+       array_map(x -> concat(upper(str1), x), arr_str) as r2
+FROM t_disable_rewrite_bug ORDER BY id;
+
+-- Case 9: With WHERE clause that also uses dict optimization
+SELECT id, array_map(x -> concat(x, upper(str1)), arr_str) as result
+FROM t_disable_rewrite_bug
+WHERE str1 IN ('apple', 'banana')
+ORDER BY id;
+
+-- Case 10: Subquery with lambda containing dict column common sub-expr
+SELECT * FROM (
+    SELECT id, array_map(x -> concat(x, '-', upper(str1)), arr_str) as result
+    FROM t_disable_rewrite_bug
+) sub WHERE array_length(result) > 0 ORDER BY id;
+
+-- Cleanup
+DROP TABLE t_disable_rewrite_bug;
