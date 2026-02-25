@@ -3,6 +3,14 @@
 -- The bug: expr_disable_open_rewrite uses children() instead of do_for_each_child(),
 -- so DictMappingExpr in lambda's _common_sub_expr is not disabled for open rewrite.
 -- This causes inconsistent state when dict_func_expr is set but data is binary.
+--
+-- Related: BE contains_dict_mapping_expr in runtime_filter_bank.cpp has same bug
+-- Related: FE ExprUtils.containsDictMappingExpr has same bug pattern
+
+-- Ensure dict optimization and runtime filters are enabled
+SET cbo_enable_low_cardinality_optimize = true;
+SET enable_global_runtime_filter = true;
+SET enable_join_runtime_filter_push_down = true;
 
 CREATE TABLE IF NOT EXISTS t_disable_rewrite_bug (
     id INT,
@@ -81,6 +89,85 @@ SELECT * FROM (
     SELECT id, array_map(x -> concat(x, '-', upper(str1)), arr_str) as result
     FROM t_disable_rewrite_bug
 ) sub WHERE array_length(result) > 0 ORDER BY id;
+
+-- Case 11: JOIN creates RuntimeFilter - the bug trigger path
+-- RuntimeFilter may be pushed through projection containing lambda with dict column
+CREATE TABLE t_join_right (
+    id INT,
+    val INT
+) ENGINE=OLAP
+DUPLICATE KEY(id)
+DISTRIBUTED BY HASH(id) BUCKETS 1
+PROPERTIES ("replication_num" = "1");
+
+INSERT INTO t_join_right VALUES (1, 100), (2, 200), (3, 300);
+
+SELECT l.id, array_map(x -> concat(x, upper(l.str1)), l.arr_str) as result
+FROM t_disable_rewrite_bug l
+INNER JOIN t_join_right r ON l.id = r.id
+ORDER BY l.id;
+
+-- Case 12: JOIN with hash on dict column in common sub-expr
+SELECT l.id, array_map(x -> murmur_hash3_32(concat(x, l.str1)), l.arr_str) as result
+FROM t_disable_rewrite_bug l
+JOIN t_join_right r ON l.id = r.id
+ORDER BY l.id;
+
+-- Case 13: LEFT JOIN
+SELECT l.id, array_map(x -> concat(x, '-', upper(l.str1)), l.arr_str) as result
+FROM t_disable_rewrite_bug l
+LEFT JOIN t_join_right r ON l.id = r.id
+ORDER BY l.id;
+
+-- Case 14: Semi-join via IN subquery
+SELECT id, array_map(x -> concat(x, upper(str1)), arr_str) as result
+FROM t_disable_rewrite_bug
+WHERE id IN (SELECT id FROM t_join_right)
+ORDER BY id;
+
+-- Case 15: Anti-join via NOT IN
+SELECT id, array_map(x -> concat(x, upper(str1)), arr_str) as result
+FROM t_disable_rewrite_bug
+WHERE id NOT IN (SELECT id FROM t_join_right)
+ORDER BY id;
+
+-- Case 16: EXISTS subquery
+SELECT l.id, array_map(x -> concat(x, upper(l.str1)), l.arr_str) as result
+FROM t_disable_rewrite_bug l
+WHERE EXISTS (SELECT 1 FROM t_join_right r WHERE r.id = l.id)
+ORDER BY l.id;
+
+-- Case 17: Multiple joins
+SELECT l.id, array_map(x -> concat(x, upper(l.str1)), l.arr_str) as result
+FROM t_disable_rewrite_bug l
+JOIN t_join_right r1 ON l.id = r1.id
+JOIN t_join_right r2 ON l.id = r2.id
+ORDER BY l.id;
+
+-- Case 18: Join with filter on dict column
+SELECT l.id, array_map(x -> concat(x, upper(l.str1)), l.arr_str) as result
+FROM t_disable_rewrite_bug l
+JOIN t_join_right r ON l.id = r.id
+WHERE l.str1 IN ('apple', 'banana')
+ORDER BY l.id;
+
+-- Case 19: Join with aggregation
+SELECT l.str1, array_agg(array_map(x -> concat(x, upper(l.str1)), l.arr_str)) as results
+FROM t_disable_rewrite_bug l
+JOIN t_join_right r ON l.id = r.id
+GROUP BY l.str1
+ORDER BY l.str1;
+
+-- Case 20: CTE with join
+WITH cte AS (
+    SELECT id, str1, arr_str FROM t_disable_rewrite_bug WHERE id <= 3
+)
+SELECT c.id, array_map(x -> concat(x, upper(c.str1)), c.arr_str) as result
+FROM cte c
+JOIN t_join_right r ON c.id = r.id
+ORDER BY c.id;
+
+DROP TABLE t_join_right;
 
 -- Cleanup
 DROP TABLE t_disable_rewrite_bug;

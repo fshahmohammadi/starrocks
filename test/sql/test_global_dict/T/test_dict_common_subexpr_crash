@@ -1,0 +1,40 @@
+-- name: test_dict_common_subexpr_crash
+-- Crash: DictMappingExpr in lambda's _common_sub_expr never gets open() called
+-- Expr::open() only traverses _children, missing _common_sub_expr
+-- Result: dict_func_expr is nullptr, evaluate tries binary path on dict data, crash in _build_slices
+
+SET cbo_enable_low_cardinality_optimize = true;
+
+CREATE TABLE t_crash (
+    id INT,
+    str_col VARCHAR(100) NOT NULL,
+    arr ARRAY<VARCHAR(10)>
+) ENGINE=OLAP
+DUPLICATE KEY(id)
+DISTRIBUTED BY HASH(id) BUCKETS 1
+PROPERTIES ("replication_num" = "1");
+
+INSERT INTO t_crash VALUES
+    (1, 'aaa', ['x', 'y']),
+    (2, 'bbb', ['a', 'b']),
+    (3, 'aaa', ['m', 'n']);
+
+[UC] ANALYZE FULL TABLE t_crash;
+function: wait_global_dict_ready('str_col', 't_crash')
+
+-- CRASH: str_col doesn't depend on x, so it's extracted to _common_sub_expr
+-- DictMappingExpr wrapping str_col is in _common_sub_expr, never opened, never rewritten
+SELECT id, array_map(x -> upper(str_col), arr) FROM t_crash ORDER BY id;
+
+-- Same pattern with different functions
+SELECT id, array_map(x -> length(str_col), arr) FROM t_crash ORDER BY id;
+SELECT id, array_map(x -> concat('prefix_', str_col), arr) FROM t_crash ORDER BY id;
+SELECT id, array_map(x -> murmur_hash3_32(str_col), arr) FROM t_crash ORDER BY id;
+
+-- Multiple references to dict column in common sub-expr
+SELECT id, array_map(x -> concat(upper(str_col), lower(str_col)), arr) FROM t_crash ORDER BY id;
+
+-- Nested lambda where inner dict ref becomes common sub-expr
+SELECT id, array_map(x -> array_map(y -> str_col, ['a']), arr) FROM t_crash ORDER BY id;
+
+DROP TABLE t_crash;
