@@ -31,7 +31,7 @@ SELECT SLEEP(3);
 -- !result
 [UC] ANALYZE FULL TABLE t1;
 -- result:
-test_db_88b0a64046af4118bc6454eaae8ecac5.t1	analyze	status	OK
+test_db_edfdbead64c9425fb76f2d6f51d9fd1c.t1	analyze	status	OK
 -- !result
 function: wait_global_dict_ready('str_col', 't1')
 -- result:
@@ -65,7 +65,7 @@ PLAN FRAGMENT 0(F00)
      preAggregation: on
      dict_col=str_col
      partitionsRatio=1/1, tabletsRatio=1/1
-     tabletList=13260
+     tabletList=13476
      actualRows=0, avgRowSize=72.0
      Pruned type: 3 <-> [ARRAY<VARCHAR(10)>]
      Pruned type: 4 <-> [ARRAY<VARCHAR(10)>]
@@ -100,10 +100,9 @@ PLAN FRAGMENT 1(F00)
   4:Project
   |  output columns:
   |  1 <-> [1: id, INT, true]
-  |  14 <-> array_map[([12, VARCHAR(10), true] -> [19: array_map, ARRAY<VARCHAR>, true], DictDecode([16: arr1, ARRAY<INT>, true], [<place-holder>])); args: FUNCTION,INVALID_TYPE; result: ARRAY<ARRAY<VARCHAR>>; args nullable: true; result nullable: true]
+  |  14 <-> array_map[([12, VARCHAR(10), true] -> [16: array_map, ARRAY<VARCHAR>, true], [3: arr1, ARRAY<VARCHAR(10)>, true]); args: FUNCTION,INVALID_TYPE; result: ARRAY<ARRAY<VARCHAR>>; args nullable: true; result nullable: true]
   |  common expressions:
-  |  18 <-> DictDecode([17: arr2, ARRAY<INT>, true], [<place-holder>])
-  |  19 <-> array_map[([13, VARCHAR(10), true] -> DictDecode([15: str_col, INT, false], [upper[(<place-holder>); args: VARCHAR; result: VARCHAR; args nullable: false; result nullable: true]]), [18: expr, ARRAY<VARCHAR(10)>, true]); args: FUNCTION,INVALID_TYPE; result: ARRAY<VARCHAR>; args nullable: true; result nullable: true]
+  |  16 <-> array_map[([13, VARCHAR(10), true] -> DictDecode([15: str_col, INT, false], [upper[(<place-holder>); args: VARCHAR; result: VARCHAR; args nullable: false; result nullable: true]]), [4: arr2, ARRAY<VARCHAR(10)>, true]); args: FUNCTION,INVALID_TYPE; result: ARRAY<VARCHAR>; args nullable: true; result nullable: true]
   |  cardinality: 2
   |  
   3:HASH JOIN
@@ -111,7 +110,7 @@ PLAN FRAGMENT 1(F00)
   |  equal join conjunct: [1: id, INT, true] = [8: id, INT, true]
   |  build runtime filters:
   |  - filter_id = 0, build_expr = (8: id), remote = false
-  |  output columns: 1, 15, 16, 17
+  |  output columns: 1, 3, 4, 15
   |  can local shuffle: false
   |  cardinality: 2
   |  
@@ -124,12 +123,12 @@ PLAN FRAGMENT 1(F00)
      table: t1, rollup: t1
      preAggregation: on
      Predicates: [1: id, INT, true] IS NOT NULL
-     dict_col=arr2,str_col,arr1
+     dict_col=str_col
      partitionsRatio=1/1, tabletsRatio=1/1
-     tabletList=13260
+     tabletList=13476
      actualRows=0, avgRowSize=71.0
-     Pruned type: 17 <-> [ARRAY<INT>]
-     Pruned type: 16 <-> [ARRAY<INT>]
+     Pruned type: 3 <-> [ARRAY<VARCHAR(10)>]
+     Pruned type: 4 <-> [ARRAY<VARCHAR(10)>]
      cardinality: 2
      probe runtime filters:
      - filter_id = 0, probe_expr = (1: id)
@@ -146,7 +145,7 @@ PLAN FRAGMENT 2(F01)
      preAggregation: on
      Predicates: [8: id, INT, true] IS NOT NULL
      partitionsRatio=1/1, tabletsRatio=1/1
-     tabletList=13266
+     tabletList=13482
      actualRows=0, avgRowSize=4.0
      cardinality: 2
 -- !result
