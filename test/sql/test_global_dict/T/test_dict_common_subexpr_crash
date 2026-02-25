@@ -1,0 +1,45 @@
+-- name: test_dict_common_subexpr_crash
+-- Bug: expr_disable_open_rewrite uses children() instead of do_for_each_child()
+-- Missing DictMappingExpr in lambda's _common_sub_expr
+-- Same pattern as PR #67843 fix for rewrite_expr
+
+CREATE TABLE t1 (
+    c VARCHAR(65535) NULL COMMENT ""
+)
+ENGINE = OLAP
+DUPLICATE KEY(c)
+DISTRIBUTED BY RANDOM
+PROPERTIES (
+    "replication_num" = "1"
+);
+
+INSERT INTO t1 VALUES ('A'), ('A');
+SELECT SLEEP(3);
+[UC] ANALYZE FULL TABLE t1;
+function: wait_global_dict_ready('c', 't1')
+
+set enable_scan_predicate_expr_reuse=false;
+
+-- Pattern from PR #67843: derived column from dict column, lambda doesn't use its argument
+WITH T2 AS (SELECT c IS NULL AS cn, [c] AS c FROM t1), T3 AS (SELECT array_length(ARRAY_MAP((arg_811) -> cn, c)) AS l FROM T2) SELECT * FROM T3;
+WITH T2 AS (SELECT c IS NULL AS cn, [c] AS c FROM t1), T3 AS (SELECT array_length(ARRAY_MAP((arg_811) -> cn, c)) AS l FROM T2) SELECT * FROM T3 WHERE l > 0;
+
+-- With upper() on dict column
+WITH T2 AS (SELECT upper(c) AS uc, [c] AS arr FROM t1), T3 AS (SELECT array_length(ARRAY_MAP((x) -> uc, arr)) AS l FROM T2) SELECT * FROM T3;
+
+-- With hash function on dict column
+WITH T2 AS (SELECT murmur_hash3_32(c) AS h, [c] AS arr FROM t1), T3 AS (SELECT array_length(ARRAY_MAP((x) -> h, arr)) AS l FROM T2) SELECT * FROM T3;
+
+-- Nested lambda pattern
+WITH T2 AS (SELECT c IS NULL AS dict, ["A"] AS arr1, ["a"] AS arr2 FROM t1), T3 AS (SELECT ARRAY_LENGTH(ARRAY_MAP((arg1)->ARRAY_SUM(ARRAY_MAP((arg2)->dict, arr2)), arr1)) AS l FROM T2) SELECT * FROM T3 WHERE l > 1;
+
+-- With JOIN (RuntimeFilter path)
+CREATE TABLE t2 (id INT) ENGINE=OLAP DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ("replication_num" = "1");
+INSERT INTO t2 VALUES (1);
+
+WITH T2 AS (SELECT c IS NULL AS cn, [c] AS arr, 1 as id FROM t1)
+SELECT array_length(ARRAY_MAP((x) -> cn, arr)) AS l
+FROM T2 JOIN t2 ON T2.id = t2.id;
+
+DROP TABLE t2;
+DROP TABLE t1;

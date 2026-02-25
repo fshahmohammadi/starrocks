@@ -1,0 +1,41 @@
+-- name: test_dict_cse_crash
+
+SET cbo_enable_low_cardinality_optimize = true;
+SET enable_global_runtime_filter = true;
+SET enable_join_runtime_filter_push_down = true;
+
+CREATE TABLE t1 (
+    id INT,
+    str_col VARCHAR(100) NOT NULL,
+    arr1 ARRAY<VARCHAR(10)>,
+    arr2 ARRAY<VARCHAR(10)>
+) ENGINE=OLAP DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ("replication_num" = "1");
+
+CREATE TABLE t2 (id INT) ENGINE=OLAP DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ("replication_num" = "1");
+
+INSERT INTO t1 VALUES (1, 'aaa', ['x','y'], ['a','b']), (2, 'bbb', ['x','y'], ['c','d']);
+INSERT INTO t2 VALUES (1), (2);
+
+SELECT SLEEP(3);
+[UC] ANALYZE FULL TABLE t1;
+function: wait_global_dict_ready('str_col', 't1')
+
+-- Check plan for nested lambda with dict column
+EXPLAIN VERBOSE
+SELECT id, array_map(x -> array_map(y -> upper(str_col), arr2), arr1) FROM t1;
+
+EXPLAIN VERBOSE
+SELECT l.id, array_map(x -> array_map(y -> upper(l.str_col), l.arr2), l.arr1)
+FROM t1 l JOIN t2 r ON l.id = r.id;
+
+-- Execute
+SELECT id, array_map(x -> array_map(y -> upper(str_col), arr2), arr1) FROM t1 ORDER BY id;
+
+SELECT l.id, array_map(x -> array_map(y -> upper(l.str_col), l.arr2), l.arr1)
+FROM t1 l JOIN t2 r ON l.id = r.id ORDER BY l.id;
+
+SELECT l.id, array_map(x -> array_map(y -> murmur_hash3_32(l.str_col), l.arr2), l.arr1)
+FROM t1 l JOIN t2 r ON l.id = r.id ORDER BY l.id;
+
+DROP TABLE t1;
+DROP TABLE t2;
