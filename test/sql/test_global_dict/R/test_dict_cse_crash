@@ -24,6 +24,7 @@ SELECT SLEEP(3);
 -- !result
 [UC] ANALYZE FULL TABLE t1;
 -- result:
+test_db_9216bcc4dc3a42c59bd9b63b323f6450.t1	analyze	status	OK
 -- !result
 function: wait_global_dict_ready('str_col', 't1')
 -- result:
@@ -32,48 +33,324 @@ function: wait_global_dict_ready('str_col', 't1')
 [UC]EXPLAIN VERBOSE
 SELECT id, array_map(x -> concat(x, upper(str_col)), arr) FROM t1;
 -- result:
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 110.0
+  Memory: 0.0
+
+PLAN FRAGMENT 0(F00)
+  Fragment Cost: 55.0
+  Output Exprs:1: id | 8: array_map
+  Input Partition: RANDOM
+  RESULT SINK
+
+  1:Project
+  |  output columns:
+  |  1 <-> [1: id, INT, true]
+  |  8 <-> array_map[([7, VARCHAR(10), true] -> concat[([7, VARCHAR(10), true], [10: expr, VARCHAR, true]); args: VARCHAR; result: VARCHAR; args nullable: true; result nullable: true], [3: arr, ARRAY<VARCHAR(10)>, true]); args: FUNCTION,INVALID_TYPE; result: ARRAY<VARCHAR>; args nullable: true; result nullable: true]
+  |  common expressions:
+  |  10 <-> DictDecode([9: str_col, INT, false], [upper[(<place-holder>); args: VARCHAR; result: VARCHAR; args nullable: false; result nullable: true]])
+  |  cardinality: 2
+  |  
+  0:OlapScanNode
+     table: t1, rollup: t1
+     preAggregation: on
+     dict_col=str_col
+     partitionsRatio=1/1, tabletsRatio=1/1
+     tabletList=14287
+     actualRows=0, avgRowSize=40.0
+     Pruned type: 3 <-> [ARRAY<VARCHAR(10)>]
+     cardinality: 2
 -- !result
 [UC]SELECT id, array_map(x -> concat(x, upper(str_col)), arr) FROM t1 ORDER BY id;
 -- result:
+1	["xAAA","yAAA"]
+2	["zBBB","wBBB"]
 -- !result
 [UC]EXPLAIN VERBOSE
 SELECT l.id, array_map(x -> concat(x, upper(l.str_col)), l.arr)
 FROM t1 l JOIN t2 r ON l.id = r.id;
 -- result:
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 298.0
+  Memory: 8.0
+
+PLAN FRAGMENT 0(F03)
+  Fragment Cost: 0.0
+  Output Exprs:1: id | 12: array_map
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  5:EXCHANGE
+     cardinality: 2
+
+PLAN FRAGMENT 1(F00)
+  Fragment Cost: 161.25
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 05
+
+  4:Project
+  |  output columns:
+  |  1 <-> [1: id, INT, true]
+  |  12 <-> array_map[([11, VARCHAR(10), true] -> concat[([11, VARCHAR(10), true], [15: expr, VARCHAR, true]); args: VARCHAR; result: VARCHAR; args nullable: true; result nullable: true], DictDecode([14: arr, ARRAY<INT>, true], [<place-holder>])); args: FUNCTION,INVALID_TYPE; result: ARRAY<VARCHAR>; args nullable: true; result nullable: true]
+  |  common expressions:
+  |  15 <-> DictDecode([13: str_col, INT, false], [upper[(<place-holder>); args: VARCHAR; result: VARCHAR; args nullable: false; result nullable: true]])
+  |  cardinality: 2
+  |  
+  3:HASH JOIN
+  |  join op: INNER JOIN (BUCKET_SHUFFLE)
+  |  equal join conjunct: [1: id, INT, true] = [7: id, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (7: id), remote = false
+  |  output columns: 1, 13, 14
+  |  can local shuffle: false
+  |  cardinality: 2
+  |  
+  |----2:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [7: id, INT, true]
+  |       cardinality: 2
+  |    
+  0:OlapScanNode
+     table: t1, rollup: t1
+     preAggregation: on
+     Predicates: [1: id, INT, true] IS NOT NULL
+     dict_col=str_col,arr
+     partitionsRatio=1/1, tabletsRatio=1/1
+     tabletList=14287
+     actualRows=0, avgRowSize=39.0
+     Pruned type: 14 <-> [ARRAY<INT>]
+     cardinality: 2
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (1: id)
+
+PLAN FRAGMENT 2(F01)
+  Fragment Cost: 4.0
+
+  Input Partition: RANDOM
+  OutPut Partition: BUCKET_SHUFFLE_HASH_PARTITIONED: 7: id
+  OutPut Exchange Id: 02
+
+  1:OlapScanNode
+     table: t2, rollup: t2
+     preAggregation: on
+     Predicates: [7: id, INT, true] IS NOT NULL
+     partitionsRatio=1/1, tabletsRatio=1/1
+     tabletList=14293
+     actualRows=0, avgRowSize=4.0
+     cardinality: 2
 -- !result
 [UC]SELECT l.id, array_map(x -> concat(x, upper(l.str_col)), l.arr)
 FROM t1 l JOIN t2 r ON l.id = r.id ORDER BY l.id;
 -- result:
+1	["xAAA","yAAA"]
+2	["zBBB","wBBB"]
 -- !result
 [UC]EXPLAIN VERBOSE
 SELECT id, array_map(x -> concat(x, upper(str_col), lower(str_col)), arr) FROM t1;
 -- result:
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 110.0
+  Memory: 0.0
+
+PLAN FRAGMENT 0(F00)
+  Fragment Cost: 55.0
+  Output Exprs:1: id | 8: array_map
+  Input Partition: RANDOM
+  RESULT SINK
+
+  1:Project
+  |  output columns:
+  |  1 <-> [1: id, INT, true]
+  |  8 <-> array_map[([7, VARCHAR(10), true] -> concat[([7, VARCHAR(10), true], [10: expr, VARCHAR, true], [11: expr, VARCHAR, true]); args: VARCHAR; result: VARCHAR; args nullable: true; result nullable: true], [3: arr, ARRAY<VARCHAR(10)>, true]); args: FUNCTION,INVALID_TYPE; result: ARRAY<VARCHAR>; args nullable: true; result nullable: true]
+  |  common expressions:
+  |  10 <-> DictDecode([9: str_col, INT, false], [upper[(<place-holder>); args: VARCHAR; result: VARCHAR; args nullable: false; result nullable: true]])
+  |  11 <-> DictDecode([9: str_col, INT, false], [lower[(<place-holder>); args: VARCHAR; result: VARCHAR; args nullable: false; result nullable: true]])
+  |  cardinality: 2
+  |  
+  0:OlapScanNode
+     table: t1, rollup: t1
+     preAggregation: on
+     dict_col=str_col
+     partitionsRatio=1/1, tabletsRatio=1/1
+     tabletList=14287
+     actualRows=0, avgRowSize=40.0
+     Pruned type: 3 <-> [ARRAY<VARCHAR(10)>]
+     cardinality: 2
 -- !result
 [UC]SELECT id, array_map(x -> concat(x, upper(str_col), lower(str_col)), arr) FROM t1 ORDER BY id;
 -- result:
+1	["xAAAaaa","yAAAaaa"]
+2	["zBBBbbb","wBBBbbb"]
 -- !result
 [UC]EXPLAIN VERBOSE
 SELECT id, array_map(x -> concat(x, hex(murmur_hash3_32(str_col))), arr) FROM t1;
 -- result:
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 110.0
+  Memory: 0.0
+
+PLAN FRAGMENT 0(F00)
+  Fragment Cost: 55.0
+  Output Exprs:1: id | 8: array_map
+  Input Partition: RANDOM
+  RESULT SINK
+
+  1:Project
+  |  output columns:
+  |  1 <-> [1: id, INT, true]
+  |  8 <-> array_map[([7, VARCHAR(10), true] -> concat[([7, VARCHAR(10), true], [11: hex, VARCHAR, true]); args: VARCHAR; result: VARCHAR; args nullable: true; result nullable: true], [3: arr, ARRAY<VARCHAR(10)>, true]); args: FUNCTION,INVALID_TYPE; result: ARRAY<VARCHAR>; args nullable: true; result nullable: true]
+  |  common expressions:
+  |  9 <-> murmur_hash3_32[([2: str_col, VARCHAR(100), false]); args: VARCHAR; result: INT; args nullable: false; result nullable: true]
+  |  10 <-> cast([9: murmur_hash3_32, INT, true] as BIGINT)
+  |  11 <-> hex[([10: cast, BIGINT, true]); args: BIGINT; result: VARCHAR; args nullable: true; result nullable: true]
+  |  cardinality: 2
+  |  
+  0:OlapScanNode
+     table: t1, rollup: t1
+     preAggregation: on
+     partitionsRatio=1/1, tabletsRatio=1/1
+     tabletList=14287
+     actualRows=0, avgRowSize=40.0
+     Pruned type: 3 <-> [ARRAY<VARCHAR(10)>]
+     cardinality: 2
 -- !result
 [UC]SELECT id, array_map(x -> concat(x, hex(murmur_hash3_32(str_col))), arr) FROM t1 ORDER BY id;
 -- result:
+1	["x3C4D190E","y3C4D190E"]
+2	["zFFFFFFFF932284BF","wFFFFFFFF932284BF"]
 -- !result
 [UC]EXPLAIN VERBOSE
 SELECT id, array_map(x -> array_map(y -> concat(y, upper(str_col)), arr), arr) FROM t1;
 -- result:
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 110.0
+  Memory: 0.0
+
+PLAN FRAGMENT 0(F00)
+  Fragment Cost: 55.0
+  Output Exprs:1: id | 9: array_map
+  Input Partition: RANDOM
+  RESULT SINK
+
+  1:Project
+  |  output columns:
+  |  1 <-> [1: id, INT, true]
+  |  9 <-> array_map[([7, VARCHAR(10), true] -> [12: array_map, ARRAY<VARCHAR>, true], [3: arr, ARRAY<VARCHAR(10)>, true]); args: FUNCTION,INVALID_TYPE; result: ARRAY<ARRAY<VARCHAR>>; args nullable: true; result nullable: true]
+  |  common expressions:
+  |  11 <-> DictDecode([10: str_col, INT, false], [upper[(<place-holder>); args: VARCHAR; result: VARCHAR; args nullable: false; result nullable: true]])
+  |  12 <-> array_map[([8, VARCHAR(10), true] -> concat[([8, VARCHAR(10), true], [11: expr, VARCHAR, true]); args: VARCHAR; result: VARCHAR; args nullable: true; result nullable: true], [3: arr, ARRAY<VARCHAR(10)>, true]); args: FUNCTION,INVALID_TYPE; result: ARRAY<VARCHAR>; args nullable: true; result nullable: true]
+  |  cardinality: 2
+  |  
+  0:OlapScanNode
+     table: t1, rollup: t1
+     preAggregation: on
+     dict_col=str_col
+     partitionsRatio=1/1, tabletsRatio=1/1
+     tabletList=14287
+     actualRows=0, avgRowSize=40.0
+     Pruned type: 3 <-> [ARRAY<VARCHAR(10)>]
+     cardinality: 2
 -- !result
 [UC]SELECT id, array_map(x -> array_map(y -> concat(y, upper(str_col)), arr), arr) FROM t1 ORDER BY id;
 -- result:
+1	[["xAAA","yAAA"],["xAAA","yAAA"]]
+2	[["zBBB","wBBB"],["zBBB","wBBB"]]
 -- !result
 [UC]EXPLAIN VERBOSE
 SELECT l.id, array_map(x -> concat(x, upper(l.str_col), lower(l.str_col)), l.arr)
 FROM t1 l JOIN t2 r ON l.id = r.id;
 -- result:
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 298.0
+  Memory: 8.0
+
+PLAN FRAGMENT 0(F03)
+  Fragment Cost: 0.0
+  Output Exprs:1: id | 12: array_map
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  5:EXCHANGE
+     cardinality: 2
+
+PLAN FRAGMENT 1(F00)
+  Fragment Cost: 161.25
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 05
+
+  4:Project
+  |  output columns:
+  |  1 <-> [1: id, INT, true]
+  |  12 <-> array_map[([11, VARCHAR(10), true] -> concat[([11, VARCHAR(10), true], [15: expr, VARCHAR, true], [16: expr, VARCHAR, true]); args: VARCHAR; result: VARCHAR; args nullable: true; result nullable: true], DictDecode([14: arr, ARRAY<INT>, true], [<place-holder>])); args: FUNCTION,INVALID_TYPE; result: ARRAY<VARCHAR>; args nullable: true; result nullable: true]
+  |  common expressions:
+  |  16 <-> DictDecode([13: str_col, INT, false], [lower[(<place-holder>); args: VARCHAR; result: VARCHAR; args nullable: false; result nullable: true]])
+  |  15 <-> DictDecode([13: str_col, INT, false], [upper[(<place-holder>); args: VARCHAR; result: VARCHAR; args nullable: false; result nullable: true]])
+  |  cardinality: 2
+  |  
+  3:HASH JOIN
+  |  join op: INNER JOIN (BUCKET_SHUFFLE)
+  |  equal join conjunct: [1: id, INT, true] = [7: id, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (7: id), remote = false
+  |  output columns: 1, 13, 14
+  |  can local shuffle: false
+  |  cardinality: 2
+  |  
+  |----2:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [7: id, INT, true]
+  |       cardinality: 2
+  |    
+  0:OlapScanNode
+     table: t1, rollup: t1
+     preAggregation: on
+     Predicates: [1: id, INT, true] IS NOT NULL
+     dict_col=str_col,arr
+     partitionsRatio=1/1, tabletsRatio=1/1
+     tabletList=14287
+     actualRows=0, avgRowSize=39.0
+     Pruned type: 14 <-> [ARRAY<INT>]
+     cardinality: 2
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (1: id)
+
+PLAN FRAGMENT 2(F01)
+  Fragment Cost: 4.0
+
+  Input Partition: RANDOM
+  OutPut Partition: BUCKET_SHUFFLE_HASH_PARTITIONED: 7: id
+  OutPut Exchange Id: 02
+
+  1:OlapScanNode
+     table: t2, rollup: t2
+     preAggregation: on
+     Predicates: [7: id, INT, true] IS NOT NULL
+     partitionsRatio=1/1, tabletsRatio=1/1
+     tabletList=14293
+     actualRows=0, avgRowSize=4.0
+     cardinality: 2
 -- !result
 [UC]SELECT l.id, array_map(x -> concat(x, upper(l.str_col), lower(l.str_col)), l.arr)
 FROM t1 l JOIN t2 r ON l.id = r.id ORDER BY l.id;
 -- result:
+1	["xAAAaaa","yAAAaaa"]
+2	["zBBBbbb","wBBBbbb"]
 -- !result
 DROP TABLE t1;
 -- result:
