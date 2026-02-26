@@ -2,69 +2,70 @@
 -- Test for crash when DictMappingExpr is in lambda's _common_sub_expr
 -- Bug: expr_disable_open_rewrite uses children() instead of do_for_each_child()
 --
--- Key pattern: TWO separate columns:
--- 1. str_col: dictified scalar VARCHAR column -> upper(str_col) becomes DictMappingExpr
--- 2. arr: array column for lambda iteration
--- Lambda: array_map(x -> concat(x, upper(str_col)), arr)
--- upper(str_col) doesn't depend on lambda arg x -> goes to lambda's _common_sub_expr
--- Result: DictMappingExpr in lambda's _common_sub_expr
+-- Pattern from PR #67843 repro:
+-- 1. Dictified column c
+-- 2. Expression on dict column (c IS NULL) becomes DictMappingExpr
+-- 3. Nested lambdas where dict expression ends up in inner lambda's _common_sub_expr
+-- 4. WHERE filter triggers the conjunct code path
 
 SET cbo_enable_low_cardinality_optimize = true;
+SET enable_scan_predicate_expr_reuse = false;
 
 CREATE TABLE t1 (
-    id INT,
-    str_col VARCHAR(100) NOT NULL,
-    arr ARRAY<VARCHAR(10)>
-) ENGINE=OLAP DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ("replication_num" = "1");
+    c VARCHAR(65535) NULL
+) ENGINE=OLAP DUPLICATE KEY(c) DISTRIBUTED BY RANDOM PROPERTIES ("replication_num" = "1");
 
-CREATE TABLE t2 (id INT) ENGINE=OLAP DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ("replication_num" = "1");
-
-INSERT INTO t1 VALUES (1, 'aaa', ['x','y']), (2, 'bbb', ['z','w']);
-INSERT INTO t2 VALUES (1), (2);
+INSERT INTO t1 VALUES ('A'), ('A');
 
 SELECT SLEEP(3);
 [UC] ANALYZE FULL TABLE t1;
-function: wait_global_dict_ready('str_col', 't1')
+function: wait_global_dict_ready('c', 't1')
 
--- Test 1: Basic - upper(str_col) in lambda common sub-expr
-[UC]EXPLAIN VERBOSE
-SELECT id, array_map(x -> concat(x, upper(str_col)), arr) FROM t1;
+-- Test 1: Nested lambda with dict expression in inner lambda's common sub-expr
+-- dict = c IS NULL doesn't depend on arg2, so it becomes inner lambda's _common_sub_expr
+WITH T2 AS (
+    SELECT c IS NULL AS dict, ['A'] AS arr1, ['a'] AS arr2 FROM t1
+),
+T3 AS (
+    SELECT ARRAY_LENGTH(ARRAY_MAP((arg1) -> ARRAY_SUM(ARRAY_MAP((arg2) -> dict, arr2)), arr1)) AS l FROM T2
+)
+SELECT * FROM T3 WHERE l > 10;
 
-[UC]SELECT id, array_map(x -> concat(x, upper(str_col)), arr) FROM t1 ORDER BY id;
+-- Test 2: Similar pattern with upper() instead of IS NULL
+WITH T2 AS (
+    SELECT upper(c) AS dict_upper, ['A'] AS arr1, ['a'] AS arr2 FROM t1
+),
+T3 AS (
+    SELECT ARRAY_LENGTH(ARRAY_MAP((arg1) -> ARRAY_SUM(ARRAY_MAP((arg2) -> length(dict_upper), arr2)), arr1)) AS l FROM T2
+)
+SELECT * FROM T3 WHERE l > 10;
 
--- Test 2: With JOIN (triggers different code paths, runtime filters)
-[UC]EXPLAIN VERBOSE
-SELECT l.id, array_map(x -> concat(x, upper(l.str_col)), l.arr)
-FROM t1 l JOIN t2 r ON l.id = r.id;
+-- Test 3: With JOIN to trigger runtime filter path
+CREATE TABLE t2 (id INT) ENGINE=OLAP DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ("replication_num" = "1");
+INSERT INTO t2 VALUES (1), (2);
 
-[UC]SELECT l.id, array_map(x -> concat(x, upper(l.str_col)), l.arr)
-FROM t1 l JOIN t2 r ON l.id = r.id ORDER BY l.id;
+WITH T2 AS (
+    SELECT c IS NULL AS dict, ['A'] AS arr1, ['a'] AS arr2, 1 as id FROM t1
+),
+T3 AS (
+    SELECT ARRAY_LENGTH(ARRAY_MAP((arg1) -> ARRAY_SUM(ARRAY_MAP((arg2) -> dict, arr2)), arr1)) AS l, id FROM T2
+)
+SELECT * FROM T3 JOIN t2 ON T3.id = t2.id WHERE l > 10;
 
--- Test 3: Multiple dict expressions in lambda common sub-expr
-[UC]EXPLAIN VERBOSE
-SELECT id, array_map(x -> concat(x, upper(str_col), lower(str_col)), arr) FROM t1;
+DROP TABLE t2;
 
-[UC]SELECT id, array_map(x -> concat(x, upper(str_col), lower(str_col)), arr) FROM t1 ORDER BY id;
+-- Test 4: Multiple levels of nesting
+WITH T2 AS (
+    SELECT c IS NULL AS dict, ['A','B'] AS arr1, ['a','b'] AS arr2, ['x','y'] AS arr3 FROM t1
+),
+T3 AS (
+    SELECT ARRAY_LENGTH(ARRAY_MAP((a1) -> ARRAY_SUM(ARRAY_MAP((a2) -> ARRAY_SUM(ARRAY_MAP((a3) -> dict, arr3)), arr2)), arr1)) AS l FROM T2
+)
+SELECT * FROM T3 WHERE l > 10;
 
--- Test 4: With hash function on dict column
-[UC]EXPLAIN VERBOSE
-SELECT id, array_map(x -> concat(x, hex(murmur_hash3_32(str_col))), arr) FROM t1;
-
-[UC]SELECT id, array_map(x -> concat(x, hex(murmur_hash3_32(str_col))), arr) FROM t1 ORDER BY id;
-
--- Test 5: Nested lambda with dict column in common sub-expr
-[UC]EXPLAIN VERBOSE
-SELECT id, array_map(x -> array_map(y -> concat(y, upper(str_col)), arr), arr) FROM t1;
-
-[UC]SELECT id, array_map(x -> array_map(y -> concat(y, upper(str_col)), arr), arr) FROM t1 ORDER BY id;
-
--- Test 6: JOIN with multiple dict expressions
-[UC]EXPLAIN VERBOSE
-SELECT l.id, array_map(x -> concat(x, upper(l.str_col), lower(l.str_col)), l.arr)
-FROM t1 l JOIN t2 r ON l.id = r.id;
-
-[UC]SELECT l.id, array_map(x -> concat(x, upper(l.str_col), lower(l.str_col)), l.arr)
-FROM t1 l JOIN t2 r ON l.id = r.id ORDER BY l.id;
+-- Test 5: Without CTE (direct query)
+SELECT ARRAY_LENGTH(ARRAY_MAP((arg1) -> ARRAY_SUM(ARRAY_MAP((arg2) -> c IS NULL, ['a'])), ['A'])) AS l
+FROM t1
+WHERE ARRAY_LENGTH(ARRAY_MAP((arg1) -> ARRAY_SUM(ARRAY_MAP((arg2) -> c IS NULL, ['a'])), ['A'])) > 10;
 
 DROP TABLE t1;
-DROP TABLE t2;
