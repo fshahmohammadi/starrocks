@@ -1,12 +1,10 @@
 -- name: test_dict_cse_crash
 -- Test for crash when DictMappingExpr is in lambda's _common_sub_expr
 -- Bug: expr_disable_open_rewrite uses children() instead of do_for_each_child()
--- which misses _common_sub_expr in LambdaFunction
--- Key: The repeated expression must involve the lambda argument to trigger CSE inside lambda
+-- Key insight: Expression inside lambda that doesn't depend on lambda arg
+-- gets extracted as lambda common sub-expression even with single occurrence
 
 SET cbo_enable_low_cardinality_optimize = true;
-SET enable_global_runtime_filter = true;
-SET enable_join_runtime_filter_push_down = true;
 
 CREATE TABLE t1 (
     id INT,
@@ -24,46 +22,48 @@ SELECT SLEEP(3);
 [UC] ANALYZE FULL TABLE t1;
 function: wait_global_dict_ready('str_col', 't1')
 
--- Test 1: Lambda argument used with dict column in repeated expression
--- upper(concat(str_col, x)) is used twice - should extract as lambda common sub-expression
+-- Test 1: upper(str_col) doesn't depend on lambda arg x, should be extracted as lambda CSE
+-- Single occurrence - but inside lambda and independent of lambda arg
 [UC]EXPLAIN VERBOSE
-SELECT id, array_map(x -> concat(upper(concat(str_col, x)), upper(concat(str_col, x))), arr1) FROM t1;
+SELECT id, array_map(x -> concat(x, upper(str_col)), arr1) FROM t1;
 
-[UC]SELECT id, array_map(x -> concat(upper(concat(str_col, x)), upper(concat(str_col, x))), arr1) FROM t1 ORDER BY id;
+[UC]SELECT id, array_map(x -> concat(x, upper(str_col)), arr1) FROM t1 ORDER BY id;
 
--- Test 2: Simpler pattern - concat(x, str_col) repeated with function
+-- Test 2: Same with JOIN
 [UC]EXPLAIN VERBOSE
-SELECT id, array_map(x -> length(concat(x, str_col)) + length(concat(x, str_col)), arr1) FROM t1;
-
-[UC]SELECT id, array_map(x -> length(concat(x, str_col)) + length(concat(x, str_col)), arr1) FROM t1 ORDER BY id;
-
--- Test 3: With JOIN for runtime filter path
-[UC]EXPLAIN VERBOSE
-SELECT l.id, array_map(x -> concat(upper(concat(l.str_col, x)), upper(concat(l.str_col, x))), l.arr1)
+SELECT l.id, array_map(x -> concat(x, upper(l.str_col)), l.arr1)
 FROM t1 l JOIN t2 r ON l.id = r.id;
 
-[UC]SELECT l.id, array_map(x -> concat(upper(concat(l.str_col, x)), upper(concat(l.str_col, x))), l.arr1)
+[UC]SELECT l.id, array_map(x -> concat(x, upper(l.str_col)), l.arr1)
 FROM t1 l JOIN t2 r ON l.id = r.id ORDER BY l.id;
 
--- Test 4: Nested lambda with repeated expression using lambda arg
+-- Test 3: Nested lambda - inner lambda uses outer's str_col
 [UC]EXPLAIN VERBOSE
-SELECT id, array_map(x -> array_map(y -> length(concat(y, str_col)) + length(concat(y, str_col)), arr2), arr1) FROM t1;
+SELECT id, array_map(x -> array_map(y -> concat(y, upper(str_col)), arr2), arr1) FROM t1;
 
-[UC]SELECT id, array_map(x -> array_map(y -> length(concat(y, str_col)) + length(concat(y, str_col)), arr2), arr1) FROM t1 ORDER BY id;
+[UC]SELECT id, array_map(x -> array_map(y -> concat(y, upper(str_col)), arr2), arr1) FROM t1 ORDER BY id;
 
--- Test 5: Nested lambda with JOIN
+-- Test 4: Nested lambda with JOIN
 [UC]EXPLAIN VERBOSE
-SELECT l.id, array_map(x -> array_map(y -> concat(upper(concat(y, l.str_col)), upper(concat(y, l.str_col))), l.arr2), l.arr1)
+SELECT l.id, array_map(x -> array_map(y -> concat(y, upper(l.str_col)), l.arr2), l.arr1)
 FROM t1 l JOIN t2 r ON l.id = r.id;
 
-[UC]SELECT l.id, array_map(x -> array_map(y -> concat(upper(concat(y, l.str_col)), upper(concat(y, l.str_col))), l.arr2), l.arr1)
+[UC]SELECT l.id, array_map(x -> array_map(y -> concat(y, upper(l.str_col)), l.arr2), l.arr1)
 FROM t1 l JOIN t2 r ON l.id = r.id ORDER BY l.id;
 
--- Test 6: Multiple functions on dict column with lambda arg
+-- Test 5: Multiple independent dict expressions in lambda
 [UC]EXPLAIN VERBOSE
-SELECT id, array_map(x -> upper(concat(x, str_col)) || lower(concat(x, str_col)) || upper(concat(x, str_col)), arr1) FROM t1;
+SELECT id, array_map(x -> concat(x, upper(str_col), lower(str_col)), arr1) FROM t1;
 
-[UC]SELECT id, array_map(x -> upper(concat(x, str_col)) || lower(concat(x, str_col)) || upper(concat(x, str_col)), arr1) FROM t1 ORDER BY id;
+[UC]SELECT id, array_map(x -> concat(x, upper(str_col), lower(str_col)), arr1) FROM t1 ORDER BY id;
+
+-- Test 6: With JOIN and multiple dict expressions
+[UC]EXPLAIN VERBOSE
+SELECT l.id, array_map(x -> concat(x, upper(l.str_col), lower(l.str_col)), l.arr1)
+FROM t1 l JOIN t2 r ON l.id = r.id;
+
+[UC]SELECT l.id, array_map(x -> concat(x, upper(l.str_col), lower(l.str_col)), l.arr1)
+FROM t1 l JOIN t2 r ON l.id = r.id ORDER BY l.id;
 
 DROP TABLE t1;
 DROP TABLE t2;
