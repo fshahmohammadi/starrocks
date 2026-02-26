@@ -1,68 +1,73 @@
 -- name: test_dict_cse_crash
 -- Test for crash when DictMappingExpr is in lambda's _common_sub_expr
 -- Bug: expr_disable_open_rewrite uses children() instead of do_for_each_child()
--- Key insight: Expression inside lambda that doesn't depend on lambda arg
--- gets extracted as lambda common sub-expression even with single occurrence
+--
+-- Key insight from FE unit tests (ExpressionTest.java line 829):
+-- To get an expression into lambda's _common_sub_expr (not Project's common expressions),
+-- the expression must depend on an OUTER lambda argument but not the INNER lambda argument.
+-- This requires NESTED lambdas where the outer lambda iterates over an array.
+--
+-- Pattern from FE test: array_map(x -> array_map(y -> array_filter(z -> z > array_length(x), y), x), ...)
+-- Here array_length(x) depends on outer arg x, not inner arg z, so it becomes inner lambda's CSE.
 
 SET cbo_enable_low_cardinality_optimize = true;
 
+-- Table with array of strings that will be dictified
 CREATE TABLE t1 (
     id INT,
-    str_col VARCHAR(100) NOT NULL,
-    arr1 ARRAY<VARCHAR(10)>,
+    str_arr ARRAY<VARCHAR(100)> NOT NULL,
     arr2 ARRAY<VARCHAR(10)>
 ) ENGINE=OLAP DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ("replication_num" = "1");
 
 CREATE TABLE t2 (id INT) ENGINE=OLAP DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ("replication_num" = "1");
 
-INSERT INTO t1 VALUES (1, 'aaa', ['x','y'], ['a','b']), (2, 'bbb', ['x','y'], ['c','d']);
+INSERT INTO t1 VALUES (1, ['aaa','bbb'], ['x','y']), (2, ['ccc','ddd'], ['z','w']);
 INSERT INTO t2 VALUES (1), (2);
 
 SELECT SLEEP(3);
 [UC] ANALYZE FULL TABLE t1;
-function: wait_global_dict_ready('str_col', 't1')
+function: wait_global_dict_ready('str_arr', 't1')
 
--- Test 1: upper(str_col) doesn't depend on lambda arg x, should be extracted as lambda CSE
--- Single occurrence - but inside lambda and independent of lambda arg
+-- Test 1: Nested lambda - upper(x) depends on outer arg x, not inner arg y
+-- upper(x) should become inner lambda's common sub-expression
+-- If str_arr is dictified, upper(x) could be DictMappingExpr in lambda's _common_sub_expr
 [UC]EXPLAIN VERBOSE
-SELECT id, array_map(x -> concat(x, upper(str_col)), arr1) FROM t1;
+SELECT id, array_map(x -> array_map(y -> concat(y, upper(x)), arr2), str_arr) FROM t1;
 
-[UC]SELECT id, array_map(x -> concat(x, upper(str_col)), arr1) FROM t1 ORDER BY id;
+[UC]SELECT id, array_map(x -> array_map(y -> concat(y, upper(x)), arr2), str_arr) FROM t1 ORDER BY id;
 
--- Test 2: Same with JOIN
+-- Test 2: Same pattern with JOIN (may trigger different code paths)
 [UC]EXPLAIN VERBOSE
-SELECT l.id, array_map(x -> concat(x, upper(l.str_col)), l.arr1)
+SELECT l.id, array_map(x -> array_map(y -> concat(y, upper(x)), l.arr2), l.str_arr)
 FROM t1 l JOIN t2 r ON l.id = r.id;
 
-[UC]SELECT l.id, array_map(x -> concat(x, upper(l.str_col)), l.arr1)
+[UC]SELECT l.id, array_map(x -> array_map(y -> concat(y, upper(x)), l.arr2), l.str_arr)
 FROM t1 l JOIN t2 r ON l.id = r.id ORDER BY l.id;
 
--- Test 3: Nested lambda - inner lambda uses outer's str_col
+-- Test 3: Triple nested - expression depends on outermost arg
 [UC]EXPLAIN VERBOSE
-SELECT id, array_map(x -> array_map(y -> concat(y, upper(str_col)), arr2), arr1) FROM t1;
+SELECT id, array_map(x -> array_map(y -> array_map(z -> concat(z, upper(x)), arr2), arr2), str_arr) FROM t1;
 
-[UC]SELECT id, array_map(x -> array_map(y -> concat(y, upper(str_col)), arr2), arr1) FROM t1 ORDER BY id;
+[UC]SELECT id, array_map(x -> array_map(y -> array_map(z -> concat(z, upper(x)), arr2), arr2), str_arr) FROM t1 ORDER BY id;
 
--- Test 4: Nested lambda with JOIN
+-- Test 4: Multiple dict operations on outer lambda arg (upper and lower)
 [UC]EXPLAIN VERBOSE
-SELECT l.id, array_map(x -> array_map(y -> concat(y, upper(l.str_col)), l.arr2), l.arr1)
+SELECT id, array_map(x -> array_map(y -> concat(y, upper(x), lower(x)), arr2), str_arr) FROM t1;
+
+[UC]SELECT id, array_map(x -> array_map(y -> concat(y, upper(x), lower(x)), arr2), str_arr) FROM t1 ORDER BY id;
+
+-- Test 5: Similar to FE unit test pattern with array_length
+[UC]EXPLAIN VERBOSE
+SELECT id, array_map(x -> array_map(y -> concat(y, upper(x), cast(length(x) as varchar)), arr2), str_arr) FROM t1;
+
+[UC]SELECT id, array_map(x -> array_map(y -> concat(y, upper(x), cast(length(x) as varchar)), arr2), str_arr) FROM t1 ORDER BY id;
+
+-- Test 6: With JOIN and multiple patterns combined
+[UC]EXPLAIN VERBOSE
+SELECT l.id, array_map(x -> array_map(y -> concat(y, upper(x), lower(x)), l.arr2), l.str_arr)
 FROM t1 l JOIN t2 r ON l.id = r.id;
 
-[UC]SELECT l.id, array_map(x -> array_map(y -> concat(y, upper(l.str_col)), l.arr2), l.arr1)
-FROM t1 l JOIN t2 r ON l.id = r.id ORDER BY l.id;
-
--- Test 5: Multiple independent dict expressions in lambda
-[UC]EXPLAIN VERBOSE
-SELECT id, array_map(x -> concat(x, upper(str_col), lower(str_col)), arr1) FROM t1;
-
-[UC]SELECT id, array_map(x -> concat(x, upper(str_col), lower(str_col)), arr1) FROM t1 ORDER BY id;
-
--- Test 6: With JOIN and multiple dict expressions
-[UC]EXPLAIN VERBOSE
-SELECT l.id, array_map(x -> concat(x, upper(l.str_col), lower(l.str_col)), l.arr1)
-FROM t1 l JOIN t2 r ON l.id = r.id;
-
-[UC]SELECT l.id, array_map(x -> concat(x, upper(l.str_col), lower(l.str_col)), l.arr1)
+[UC]SELECT l.id, array_map(x -> array_map(y -> concat(y, upper(x), lower(x)), l.arr2), l.str_arr)
 FROM t1 l JOIN t2 r ON l.id = r.id ORDER BY l.id;
 
 DROP TABLE t1;
