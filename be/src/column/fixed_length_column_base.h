@@ -20,9 +20,9 @@
 #include "base/container/raw_container.h"
 #include "column/column.h"
 #include "column/container_resource.h"
-#include "column/vectorized_fwd.h"
 #include "common/statusor.h"
 #include "types/datum.h"
+
 namespace starrocks {
 
 template <typename T>
@@ -66,7 +66,13 @@ public:
     // construct the wrapped object first, move constructor is used to prevent the unnecessary
     // time-consuming copy operation.
     FixedLengthColumnBase(FixedLengthColumnBase&& src) noexcept
-            : _resource(std::move(src._resource)), _data(std::move(src._data)) {}
+            : _resource(std::move(src._resource)), _data(std::move(src._data)) {
+        // Preserve dict_map for int32_t columns (used for dict-encoded columns)
+        if constexpr (std::is_same_v<T, int32_t>) {
+            _dict_map = src._dict_map;
+            src._dict_map = nullptr;
+        }
+    }
 
     bool is_numeric() const override { return std::is_arithmetic_v<ValueType>; }
 
@@ -264,12 +270,20 @@ public:
         std::swap(this->_delete_state, r._delete_state);
         std::swap(this->_data, r._data);
         std::swap(this->_resource, r._resource);
+        // Preserve dict_map for int32_t columns (used for dict-encoded columns)
+        if constexpr (std::is_same_v<T, int32_t>) {
+            std::swap(this->_dict_map, r._dict_map);
+        }
     }
 
     void reset_column() override {
         Column::reset_column();
         _resource.reset();
         _data.clear();
+        // Reset dict_map for int32_t columns
+        if constexpr (std::is_same_v<T, int32_t>) {
+            _dict_map = nullptr;
+        }
     }
 
     // The `_data` support one size(> 2^32), but some interface such as update_rows() will use index of uint32_t to
@@ -278,9 +292,38 @@ public:
 
     void check_or_die() const override {}
 
+    // Dict map accessors for dict-encoded int32 columns.
+    // These are only meaningful for int32_t columns used in dictionary encoding.
+    // For other types, these are no-ops that will be optimized away.
+    // The dict_map is stored as void* to avoid including runtime/global_dict headers.
+    // Callers must cast to the appropriate type (RGlobalDictMap*).
+    void set_dict_map(const void* dict_map) {
+        if constexpr (std::is_same_v<T, int32_t>) {
+            _dict_map = dict_map;
+        }
+    }
+
+    const void* dict_map() const {
+        if constexpr (std::is_same_v<T, int32_t>) {
+            return _dict_map;
+        } else {
+            return nullptr;
+        }
+    }
+
 protected:
     ContainerResource _resource;
     Container _data;
+
+    // Dict map pointer for int32_t columns (used for dict-encoded columns).
+    // This enables dict-aware hashing where we hash the original string values
+    // instead of the integer codes during shuffle operations.
+    // Stored as void* to avoid module boundary violations (column module
+    // shouldn't depend on runtime/global_dict). The actual type is RGlobalDictMap*.
+    // For non-int32_t types, this member doesn't add any overhead due to
+    // [[no_unique_address]] and empty struct optimization.
+    struct EmptyDictMap {};
+    [[no_unique_address]] std::conditional_t<std::is_same_v<T, int32_t>, const void*, EmptyDictMap> _dict_map{};
 
 private:
     using Column::append;

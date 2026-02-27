@@ -28,6 +28,7 @@
 #include "column/struct_column.h"
 #include "column/vectorized_fwd.h"
 #include "gutil/casts.h"
+#include "runtime/global_dict/types.h"
 #include "types/date_value.h"
 #include "types/decimalv2_value.h"
 #include "types/decimalv3.h"
@@ -345,5 +346,105 @@ INSTANTIATE_TEST_SUITE_P(AllHashFunctions, ColumnHashTest, ::testing::ValuesIn(k
                          [](const ::testing::TestParamInfo<HashFunctionParam>& info) {
                              return std::string(info.param.name);
                          });
+
+// ============================================================================
+// Dict-aware hashing tests
+// Verify dict-encoded int32 columns hash string values when dict_map is set.
+// ============================================================================
+
+// Test dict-encoded column produces same hash as equivalent string column
+TEST(DictAwareHashTest, DictEncodedHashMatchesStringHash) {
+    RGlobalDictMap dict_map;
+    dict_map[1] = Slice("apple");
+    dict_map[2] = Slice("banana");
+    dict_map[3] = Slice("cherry");
+
+    auto dict_col = Int32Column::create();
+    dict_col->append(1);
+    dict_col->append(2);
+    dict_col->append(3);
+    dict_col->set_dict_map(&dict_map);
+
+    auto str_col = BinaryColumn::create();
+    str_col->append("apple");
+    str_col->append("banana");
+    str_col->append("cherry");
+
+    std::vector<uint32_t> dict_hashes(3, 0);
+    std::vector<uint32_t> str_hashes(3, 0);
+
+    dict_col->crc32_hash(dict_hashes.data(), 0, 3);
+    str_col->crc32_hash(str_hashes.data(), 0, 3);
+
+    EXPECT_EQ(dict_hashes[0], str_hashes[0]);
+    EXPECT_EQ(dict_hashes[1], str_hashes[1]);
+    EXPECT_EQ(dict_hashes[2], str_hashes[2]);
+}
+
+// Test int32 column without dict_map hashes integers normally
+TEST(DictAwareHashTest, Int32WithoutDictMapHashesIntegers) {
+    auto col = Int32Column::create();
+    col->append(100);
+    col->append(200);
+
+    std::vector<uint32_t> hashes(2, 0);
+    col->crc32_hash(hashes.data(), 0, 2);
+
+    // Different values should produce different hashes
+    EXPECT_NE(hashes[0], hashes[1]);
+}
+
+// Test fnv_hash_at for single element hashing
+TEST(DictAwareHashTest, FnvHashAt) {
+    RGlobalDictMap dict_map;
+    dict_map[1] = Slice("first");
+    dict_map[2] = Slice("second");
+
+    auto dict_col = Int32Column::create();
+    dict_col->append(1);
+    dict_col->append(2);
+    dict_col->set_dict_map(&dict_map);
+
+    auto str_col = BinaryColumn::create();
+    str_col->append("first");
+    str_col->append("second");
+
+    uint32_t dict_hash = 0;
+    uint32_t str_hash = 0;
+
+    dict_col->fnv_hash_at(&dict_hash, 1);
+    str_col->fnv_hash_at(&str_hash, 1);
+
+    EXPECT_EQ(dict_hash, str_hash);
+}
+
+// Test xxh3_hash_selective for selective index hashing
+TEST(DictAwareHashTest, Xxh3HashSelective) {
+    RGlobalDictMap dict_map;
+    dict_map[1] = Slice("one");
+    dict_map[2] = Slice("two");
+    dict_map[3] = Slice("three");
+
+    auto dict_col = Int32Column::create();
+    dict_col->append(1);
+    dict_col->append(2);
+    dict_col->append(3);
+    dict_col->set_dict_map(&dict_map);
+
+    auto str_col = BinaryColumn::create();
+    str_col->append("one");
+    str_col->append("two");
+    str_col->append("three");
+
+    uint16_t sel[] = {0, 2};
+    std::vector<uint32_t> dict_hashes(3, 0);
+    std::vector<uint32_t> str_hashes(3, 0);
+
+    dict_col->xxh3_hash_selective(dict_hashes.data(), sel, 2);
+    str_col->xxh3_hash_selective(str_hashes.data(), sel, 2);
+
+    EXPECT_EQ(dict_hashes[0], str_hashes[0]);
+    EXPECT_EQ(dict_hashes[2], str_hashes[2]);
+}
 
 } // namespace starrocks

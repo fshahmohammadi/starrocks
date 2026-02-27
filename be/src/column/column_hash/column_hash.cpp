@@ -31,6 +31,7 @@
 #include "column/object_column.h"
 #include "column/struct_column.h"
 #include "common/status.h"
+#include "runtime/global_dict/types.h"
 #include "types/time_types.h"
 
 namespace starrocks {
@@ -151,6 +152,30 @@ public:
 
     template <typename T>
     Status do_visit(const FixedLengthColumnBase<T>& column) {
+        // For int32_t columns with dict_map set, hash the original string values
+        // instead of the integer codes. This ensures consistent hash distribution
+        // when joining dict-encoded columns with regular string columns.
+        if constexpr (std::is_same_v<T, int32_t>) {
+            const auto* dict_map_ptr = column.dict_map();
+            if (dict_map_ptr != nullptr) {
+                // Cast from void* to actual RGlobalDictMap* type
+                const auto* dict_map = static_cast<const RGlobalDictMap*>(dict_map_ptr);
+                const auto datas = column.immutable_data();
+                _selector.for_each([&](uint32_t idx) {
+                    uint32_t* slot_ptr = slot(idx);
+                    int32_t code = datas[idx];
+                    auto it = dict_map->find(code);
+                    if (it != dict_map->end()) {
+                        // Hash the original string value
+                        const Slice& str = it->second;
+                        *slot_ptr = HashFunction::hash(str.data, static_cast<int32_t>(str.size), *slot_ptr);
+                    }
+                    // If code not found (e.g., null placeholder 0), preserve the existing hash
+                });
+                return Status::OK();
+            }
+        }
+
         auto hash_value = [](const T& value, uint32_t* hash) {
             // Specialized implementation for CRC32, for compatibility
             if constexpr (std::is_same_v<HashFunction, CRC32Hash> && (IsDate<T> || IsTimestamp<T>)) {

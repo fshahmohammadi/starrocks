@@ -35,7 +35,14 @@ public:
 
     DISALLOW_COPY_TEMPLATE(FixedLengthColumn, FixedLengthColumn<T>);
 
-    MutableColumnPtr clone_empty() const override { return this->create(); }
+    MutableColumnPtr clone_empty() const override {
+        auto p = this->create();
+        // Preserve dict_map for int32_t columns (used for dict-encoded columns)
+        if constexpr (std::is_same_v<T, int32_t>) {
+            down_cast<FixedLengthColumn<T>*>(p.get())->set_dict_map(this->dict_map());
+        }
+        return p;
+    }
 
     MutableColumnPtr clone() const override {
         auto p = clone_empty();
