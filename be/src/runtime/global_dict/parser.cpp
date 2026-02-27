@@ -20,6 +20,7 @@
 #include "column/column_builder.h"
 #include "column/column_helper.h"
 #include "column/column_viewer.h"
+#include "column/fixed_length_column.h"
 #include "column/vectorized_fwd.h"
 #include "common/global_types.h"
 #include "common/statusor.h"
@@ -397,6 +398,15 @@ Status DictOptimizeParser::_eval_and_rewrite(RuntimeState* runtime_state, ExprCo
 
         if (_mutable_dict_maps->count(targetSlotId) == 0) {
             _mutable_dict_maps->emplace(targetSlotId, std::make_pair(std::move(result_map), std::move(rresult_map)));
+        }
+
+        // Attach reverse dict map to the column for dict-aware hashing.
+        // This enables consistent hash distribution when joining dict-encoded
+        // columns with regular string columns during shuffle operations.
+        auto& stored_maps = _mutable_dict_maps->at(targetSlotId);
+        if (auto* int_col = dynamic_cast<Int32Column*>(
+                    ColumnHelper::get_data_column(dict_opt_ctx->convert_column.get()))) {
+            int_col->set_dict_map(&stored_maps.second);
         }
     }
     return Status::OK();
