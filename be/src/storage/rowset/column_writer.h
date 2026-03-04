@@ -155,6 +155,11 @@ public:
 
     virtual Status append(const Column& column) = 0;
 
+    // Append dict-encoded column data (Int32 codes) with a reverse dict for indexes/metadata.
+    virtual Status append_dict_codes(const Column& dict_code_column, const RGlobalDictMap& reverse_dict) {
+        return Status::NotSupported("append_dict_codes not supported for this column writer");
+    }
+
     virtual Status finish_current_page() = 0;
 
     virtual uint64_t estimate_buffer_size() = 0;
@@ -211,6 +216,8 @@ public:
     Status init() override;
 
     Status append(const Column& column) override;
+
+    Status append_dict_codes(const Column& dict_code_column, const RGlobalDictMap& reverse_dict) override;
 
     // Write offset column, it's only used in ArrayColumn
     Status append_array_offsets(const Column& column);
@@ -313,6 +320,9 @@ private:
     int64_t _previous_ordinal = 0;
 
     bool _is_global_dict_valid = true;
+
+    // Set to true when append_dict_codes() was used, meaning all data came from global dict
+    bool _used_dict_code_input = false;
 
     uint64_t _total_mem_footprint = 0;
 };

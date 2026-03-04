@@ -562,6 +562,9 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
 
     @Override
     public DecodeInfo visit(OptExpression optExpression, DecodeInfo context) {
+        if (!isQuery && sessionVariable.isEnableDictOptimizeSink() && context.parent == null) {
+            return context.createOutputInfo();
+        }
         return context.createDecodeInfo();
     }
 
