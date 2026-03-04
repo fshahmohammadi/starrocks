@@ -38,6 +38,7 @@
 #include <memory>
 
 #include "base/simd/simd.h"
+#include "column/fixed_length_column.h"
 #include "column/nullable_column.h"
 #include "fs/fs.h"
 #include "gutil/strings/substitute.h"
@@ -49,6 +50,7 @@
 #include "base/string/faststring.h"
 #include "storage/rowset/array_column_writer.h"
 #include "storage/rowset/bitmap_index_writer.h"
+#include "storage/rowset/binary_dict_page.h"
 #include "storage/rowset/bitshuffle_page.h"
 #include "storage/rowset/bloom_filter_index_writer.h"
 #include "storage/rowset/encoding_info.h"
@@ -224,6 +226,11 @@ public:
     Status init() override { return _scalar_column_writer->init(); };
 
     Status append(const Column& column) override;
+
+    Status append_dict_codes(const Column& dict_code_column, const RGlobalDictMap& reverse_dict) override {
+        // Skip string length checks and encoding speculation for dict codes
+        return _scalar_column_writer->append_dict_codes(dict_code_column, reverse_dict);
+    }
 
     // Speculate char/varchar encoding and reset encoding
     void speculate_column_and_set_encoding(const Column& column);
@@ -475,7 +482,9 @@ uint64_t ScalarColumnWriter::estimate_buffer_size() {
 }
 
 Status ScalarColumnWriter::finish() {
-    if (_encoding_info->encoding() == DICT_ENCODING && _opts.global_dict != nullptr) {
+    if (_used_dict_code_input) {
+        _is_global_dict_valid = true;
+    } else if (_encoding_info->encoding() == DICT_ENCODING && _opts.global_dict != nullptr) {
         _is_global_dict_valid = _page_builder->is_valid_global_dict(_opts.global_dict);
     } else {
         _is_global_dict_valid = false;
@@ -694,6 +703,103 @@ Status ScalarColumnWriter::append(const Column& column) {
     const uint8_t* null =
             is_nullable() ? down_cast<const NullableColumn*>(&column)->null_column()->raw_data() : nullptr;
     return append(ptr, null, column.size(), column.has_null());
+}
+
+Status ScalarColumnWriter::append_dict_codes(const Column& dict_code_column, const RGlobalDictMap& reverse_dict) {
+    _total_mem_footprint += dict_code_column.byte_size();
+    _used_dict_code_input = true;
+
+    auto* dict_page_builder = down_cast<BinaryDictPageBuilder*>(_page_builder.get());
+
+    const Column* data_column = &dict_code_column;
+    const uint8_t* null_flags = nullptr;
+    bool has_null = false;
+    if (is_nullable()) {
+        auto* nullable = down_cast<const NullableColumn*>(&dict_code_column);
+        data_column = nullable->data_column().get();
+        null_flags = nullable->null_column()->raw_data();
+        has_null = nullable->has_null();
+    }
+    auto* int32_col = down_cast<const Int32Column*>(data_column);
+    const int32_t* codes = int32_col->get_data().data();
+    size_t count = int32_col->size();
+
+    // Update zone maps, bloom filters, etc. with decoded string values
+    if (_has_index_builder) {
+        for (size_t i = 0; i < count; ++i) {
+            if (has_null && null_flags[i]) {
+                INDEX_ADD_NULLS(_zone_map_index_builder, 1);
+                INDEX_ADD_NULLS(_bitmap_index_builder, 1);
+                INDEX_ADD_NULLS(_bloom_filter_index_builder, 1);
+#ifndef __APPLE__
+                INDEX_ADD_NULLS(_inverted_index_builder, 1);
+#endif
+            } else {
+                auto str_it = reverse_dict.find(codes[i]);
+                DCHECK(str_it != reverse_dict.end());
+                const Slice& s = str_it->second;
+                INDEX_ADD_VALUES(_zone_map_index_builder, reinterpret_cast<const uint8_t*>(&s), 1);
+                INDEX_ADD_VALUES(_bitmap_index_builder, reinterpret_cast<const uint8_t*>(&s), 1);
+                INDEX_ADD_VALUES(_bloom_filter_index_builder, reinterpret_cast<const uint8_t*>(&s), 1);
+#ifndef __APPLE__
+                INDEX_ADD_VALUES(_inverted_index_builder, reinterpret_cast<const uint8_t*>(&s), 1);
+#endif
+            }
+        }
+    }
+
+    // Write dict codes to pages, following the same pattern as append()
+    size_t remaining = count;
+    size_t offset = 0;
+    while (remaining > 0) {
+        size_t num_written = 0;
+        bool page_full = false;
+        bool has_null_in_page = false;
+
+        if (_curr_page_format == 2) {
+            // Page format v2: write all codes (including at null positions), track nulls separately
+            num_written = dict_page_builder->add_dict_codes(codes + offset, remaining, reverse_dict);
+            page_full = num_written < remaining;
+            if (_null_map_builder_v2 != nullptr) {
+                _null_map_builder_v2->add_null_flags(null_flags + offset, num_written);
+                has_null_in_page = has_null && (nullptr != memchr(null_flags + offset, 1, num_written));
+                has_null_in_page |= _null_map_builder_v2->has_null();
+                _null_map_builder_v2->set_has_null(has_null_in_page);
+            }
+        } else if (!has_null) {
+            num_written = dict_page_builder->add_dict_codes(codes + offset, remaining, reverse_dict);
+            page_full = num_written < remaining;
+            if (_null_map_builder_v1 != nullptr) {
+                _null_map_builder_v1->add_run(false, num_written);
+            }
+        } else {
+            // Page format v1 with nulls: skip null rows, write non-null runs
+            const int32_t* ptr = codes + offset;
+            ByteIterator iter(null_flags + offset, remaining);
+            for (auto pair = iter.next(); pair.first > 0 && !page_full; pair = iter.next()) {
+                auto [run, is_null] = pair;
+                size_t num_add = run;
+                if (!is_null) {
+                    num_add = dict_page_builder->add_dict_codes(ptr, run, reverse_dict);
+                    _null_map_builder_v1->add_run(false, run);
+                } else {
+                    _null_map_builder_v1->add_run(true, run);
+                    has_null_in_page = true;
+                }
+                page_full = num_add < run;
+                num_written += num_add;
+                ptr += num_add;
+            }
+        }
+
+        _next_rowid += num_written;
+        offset += num_written;
+        if (page_full) {
+            RETURN_IF_ERROR(finish_current_page());
+        }
+        remaining -= num_written;
+    }
+    return Status::OK();
 }
 
 Status ScalarColumnWriter::append_array_offsets(const Column& column) {

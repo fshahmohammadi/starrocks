@@ -82,10 +82,14 @@ public class DecodeRewriter extends OptExpressionVisitor<OptExpression, ColumnRe
 
     private final SessionVariable sessionVariable;
 
-    public DecodeRewriter(ColumnRefFactory factory, DecodeContext context, SessionVariable sessionVariable) {
+    private final boolean skipDictDecode;
+
+    public DecodeRewriter(ColumnRefFactory factory, DecodeContext context, SessionVariable sessionVariable,
+                          boolean skipDictDecode) {
         this.factory = factory;
         this.context = context;
         this.sessionVariable = sessionVariable;
+        this.skipDictDecode = skipDictDecode;
     }
 
     // For structs, we only return the encoded fields collected by DecodeCollector.
@@ -115,6 +119,10 @@ public class DecodeRewriter extends OptExpressionVisitor<OptExpression, ColumnRe
         // compute the fragment used dict expr
         optExpression = rewriteImpl(optExpression, new ColumnRefSet());
         if (!decodeInfo.outputStringColumns.isEmpty()) {
+            if (skipDictDecode) {
+                // Dict columns flow to sink undecoded
+                return optExpression;
+            }
             // decode the output dict column
             return insertStructuredDecodeNode(optExpression, decodeInfo.outputStringColumns, decodeInfo.outputStringColumns);
         }

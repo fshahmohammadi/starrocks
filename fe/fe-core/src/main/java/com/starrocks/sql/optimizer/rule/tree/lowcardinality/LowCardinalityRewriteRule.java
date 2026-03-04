@@ -39,7 +39,8 @@ public class LowCardinalityRewriteRule implements TreeRewriteRule {
                 return root;
             }
         }
-        DecodeRewriter rewriter = new DecodeRewriter(factory, context, session);
+        boolean skipDictDecode = !isQuery && session.isEnableDictOptimizeSink();
+        DecodeRewriter rewriter = new DecodeRewriter(factory, context, session, skipDictDecode);
         return rewriter.rewrite(root);
     }
 }

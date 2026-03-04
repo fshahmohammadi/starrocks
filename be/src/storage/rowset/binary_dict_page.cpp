@@ -182,6 +182,58 @@ bool BinaryDictPageBuilder::is_valid_global_dict(const GlobalDictMap* global_dic
     return true;
 }
 
+uint32_t BinaryDictPageBuilder::add_dict_codes(const int32_t* global_codes, uint32_t count,
+                                                const RGlobalDictMap& reverse_dict) {
+    if (_encoding_type == DICT_ENCODING) {
+        DCHECK(!_finished);
+        DCHECK_GT(count, 0);
+        auto* code_page = down_cast<BitshufflePageBuilder<TYPE_INT>*>(_data_page_builder.get());
+
+        if (_data_page_builder->count() == 0) {
+            auto it = reverse_dict.find(global_codes[0]);
+            DCHECK(it != reverse_dict.end());
+            const Slice& s = it->second;
+            _first_value.assign_copy(reinterpret_cast<const uint8_t*>(s.get_data()), s.get_size());
+        }
+
+        for (uint32_t i = 0; i < count; ++i) {
+            int32_t global_code = global_codes[i];
+            uint32_t local_code;
+            auto local_it = _global_to_local.find(global_code);
+            if (local_it != _global_to_local.end()) {
+                local_code = local_it->second;
+            } else {
+                // Look up the string from the reverse dict and add to local dict
+                auto str_it = reverse_dict.find(global_code);
+                DCHECK(str_it != reverse_dict.end());
+                const Slice& s = str_it->second;
+                if (!_dict_builder->add_slice(s)) {
+                    return i;
+                }
+                local_code = _dictionary.size();
+                _dictionary.insert_or_assign(std::string(s.data, s.size), local_code);
+                _global_to_local[global_code] = local_code;
+            }
+            if (code_page->add_one(reinterpret_cast<const uint8_t*>(&local_code)) < 1) {
+                return i;
+            }
+        }
+        return count;
+    } else {
+        // Fallback to PLAIN_ENCODING: decode global codes to strings and write them
+        DCHECK_EQ(_encoding_type, PLAIN_ENCODING);
+        for (uint32_t i = 0; i < count; ++i) {
+            auto str_it = reverse_dict.find(global_codes[i]);
+            DCHECK(str_it != reverse_dict.end());
+            const Slice& s = str_it->second;
+            if (_data_page_builder->add(reinterpret_cast<const uint8_t*>(&s), 1) < 1) {
+                return i;
+            }
+        }
+        return count;
+    }
+}
+
 template <LogicalType Type>
 BinaryDictPageDecoder<Type>::BinaryDictPageDecoder(Slice data)
         : _data(data), _data_page_decoder(nullptr), _parsed(false), _encoding_type(UNKNOWN_ENCODING) {}

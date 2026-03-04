@@ -16,8 +16,14 @@
 
 #include "column/column.h"
 #include "common/status.h"
+#include "runtime/global_dict/types_fwd_decl.h"
 
 namespace starrocks {
+
+// Decode a dict-encoded column (Int32 codes) to a string column (BinaryColumn).
+// Uses batch append_strings() for efficiency.
+// Handles both nullable and non-nullable input.
+ColumnPtr decode_dict_column_to_string(const Column& dict_column, const RGlobalDictMap& reverse_dict);
 
 class GlobalDictDecoder {
 public:

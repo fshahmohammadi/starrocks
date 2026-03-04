@@ -16,11 +16,14 @@
 
 #include <atomic>
 #include <ostream>
+#include <set>
+#include <unordered_map>
 
 #include "column/vectorized_fwd.h"
 #include "exec/sorting/sort_permute.h"
 #include "gen_cpp/data.pb.h"
 #include "gen_cpp/olap_file.pb.h"
+#include "runtime/global_dict/types_fwd_decl.h"
 #include "storage/chunk_aggregator.h"
 #include "storage/olap_define.h"
 #include "storage/primary_key_encoding_types.h"
@@ -109,6 +112,8 @@ public:
 
     void set_write_buffer_row(size_t max_buffer_row) { _max_buffer_row = max_buffer_row; }
 
+    void set_global_dicts(GlobalDictByNameMaps* global_dicts) { _global_dicts = global_dicts; }
+
     static Schema convert_schema(const TabletSchemaCSPtr& tablet_schema,
                                  const std::vector<SlotDescriptor*>* slot_descs);
 
@@ -172,6 +177,15 @@ private:
 
     MemtableStats _stats;
     PrimaryKeyEncodingType _pk_encoding_type = PrimaryKeyEncodingType::PK_ENCODING_TYPE_NONE;
+
+    // Global dicts for dict-encoded column optimization
+    GlobalDictByNameMaps* _global_dicts = nullptr;
+    // Column indices (in _vectorized_schema) where incoming data is dict-encoded Int32
+    std::set<int> _dict_encoded_columns;
+    // Cached reverse dicts (code -> string) for dict-encoded columns, keyed by column index
+    std::unordered_map<int, RGlobalDictMap> _reverse_global_dicts;
+    // Whether dict-encoded columns have been detected (done once on first insert)
+    bool _dict_columns_detected = false;
 };
 
 inline std::ostream& operator<<(std::ostream& os, const MemTable& table) {

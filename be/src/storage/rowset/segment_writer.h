@@ -39,6 +39,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/status.h"
@@ -173,6 +175,12 @@ private:
     // Check global dictionary validity for a single column writer
     void _check_column_global_dict_valid(ColumnWriter* column_writer, uint32_t column_index);
 
+    // Check if a column contains Int32 dict codes (vs string data)
+    static bool _is_dict_encoded_input(const Column* col);
+
+    // Decode a dict-encoded Int32 datum to its string value using the reverse dict
+    Datum _decode_dict_datum(uint32_t col_idx, const Column* col, size_t row_idx) const;
+
     uint32_t _segment_id;
     TabletSchemaCSPtr _tablet_schema;
     SegmentWriterOptions _opts;
@@ -195,6 +203,15 @@ private:
     uint32_t _num_rows = 0;
 
     DictColumnsValidMap _global_dict_columns_valid_info;
+
+    // Global dict pointers for VARCHAR columns (column writer index -> dict), stored during init()
+    std::unordered_map<uint32_t, const GlobalDictMap*> _global_dict_ptrs;
+    // Reverse dict maps (code -> string) for dict-encoded columns, built lazily on first chunk
+    std::unordered_map<uint32_t, RGlobalDictMap> _reverse_global_dicts;
+    // Set of column writer indices that receive dict-encoded (Int32) data
+    std::unordered_set<uint32_t> _dict_encoded_column_indices;
+    // Whether dict-encoded column detection has been performed (done once on first append_chunk)
+    bool _dict_columns_detected = false;
 };
 
 } // namespace starrocks

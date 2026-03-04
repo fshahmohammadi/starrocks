@@ -14,17 +14,21 @@
 
 #include "storage/memtable.h"
 
+#include <algorithm>
 #include <memory>
 
 #include "base/time/time.h"
 #include "column/binary_column.h"
+#include "column/fixed_length_column.h"
 #include "column/json_column.h"
+#include "column/nullable_column.h"
 #include "common/logging.h"
 #include "exec/sorting/sorting.h"
 #include "gutil/strings/substitute.h"
 #include "io/io_profiler.h"
 #include "runtime/current_thread.h"
 #include "runtime/descriptors.h"
+#include "runtime/global_dict/decoder.h"
 #include "runtime/load_fail_point.h"
 #include "runtime/starrocks_metrics.h"
 #include "storage/chunk_helper.h"
@@ -173,6 +177,47 @@ StatusOr<bool> MemTable::insert(const Chunk& chunk, const uint32_t* indexes, uin
     ADD_COUNTER_RELAXED(_stats.insert_count, 1);
     if (_chunk == nullptr) {
         _chunk = ChunkHelper::new_chunk(*_vectorized_schema, 0);
+        // Detect dict-encoded columns by checking actual incoming data types.
+        // When the FE dict optimization is active, VARCHAR columns arrive as Int32 dict codes.
+        if (_global_dicts != nullptr && !_dict_columns_detected) {
+            _dict_columns_detected = true;
+            for (int i = 0; i < _vectorized_schema->num_fields(); i++) {
+                const FieldPtr& f = _vectorized_schema->field(i);
+                if (f->type()->type() != TYPE_VARCHAR) continue;
+                std::string col_name(f->name());
+                if (_global_dicts->find(col_name) == _global_dicts->end()) continue;
+                // Check if the incoming chunk's column is actually Int32 (dict-encoded)
+                const Column* src_col = nullptr;
+                if (_slot_descs != nullptr && i < static_cast<int>(_slot_descs->size())) {
+                    src_col = chunk.get_column_by_slot_id((*_slot_descs)[i]->id()).get();
+                } else if (i < static_cast<int>(chunk.num_columns())) {
+                    src_col = chunk.get_column_by_index(i).get();
+                }
+                if (src_col == nullptr) continue;
+                const Column* data_col = src_col;
+                if (src_col->is_nullable()) {
+                    data_col = down_cast<const NullableColumn*>(src_col)->data_column().get();
+                }
+                if (data_col->is_numeric()) {
+                    _dict_encoded_columns.insert(i);
+                    // Build and cache reverse dict (code -> string)
+                    auto dict_it = _global_dicts->find(col_name);
+                    RGlobalDictMap rdict;
+                    for (auto& [s, c] : dict_it->second.dict) {
+                        rdict[c] = s;
+                    }
+                    _reverse_global_dicts[i] = std::move(rdict);
+                    // Replace the BinaryColumn with Int32Column in _chunk
+                    auto int32_col = Int32Column::create();
+                    if (f->is_nullable()) {
+                        auto nullable_col = NullableColumn::create(std::move(int32_col), NullColumn::create());
+                        _chunk->update_column_by_index(std::move(nullable_col), i);
+                    } else {
+                        _chunk->update_column_by_index(std::move(int32_col), i);
+                    }
+                }
+            }
+        }
     }
 
     bool is_column_with_row = false;
@@ -189,8 +234,26 @@ StatusOr<bool> MemTable::insert(const Chunk& chunk, const uint32_t* indexes, uin
             is_column_with_row = true;
             // add row column
             auto row_encoder = RowStoreEncoderFactory::instance()->get_or_create_encoder(SIMPLE);
-            (void)row_encoder->encode_chunk_to_full_row_column(*schema_without_full_row_column, chunk,
-                                                               full_row_col.get());
+            if (!_dict_encoded_columns.empty()) {
+                // Decode dict-encoded columns for full row encoding using cached reverse dicts.
+                // Uses batch decode_dict_column_to_string() following the read path pattern.
+                auto decoded_chunk = chunk.clone_unique();
+                for (int idx : _dict_encoded_columns) {
+                    const Column* src_col = nullptr;
+                    if (_slot_descs != nullptr && idx < static_cast<int>(_slot_descs->size())) {
+                        src_col = chunk.get_column_by_slot_id((*_slot_descs)[idx]->id()).get();
+                    } else {
+                        src_col = chunk.get_column_by_index(idx).get();
+                    }
+                    decoded_chunk->update_column_by_index(
+                            decode_dict_column_to_string(*src_col, _reverse_global_dicts[idx]), idx);
+                }
+                (void)row_encoder->encode_chunk_to_full_row_column(*schema_without_full_row_column, *decoded_chunk,
+                                                                   full_row_col.get());
+            } else {
+                (void)row_encoder->encode_chunk_to_full_row_column(*schema_without_full_row_column, chunk,
+                                                                   full_row_col.get());
+            }
         } else {
             // when doing schema change, the chunk has shadow columns,
             // so the columns in the chunk will be more than the fields in the schema.
@@ -551,8 +614,67 @@ Status MemTable::_sort_column_inc(bool by_sort_key) {
         }
     }
 
+    // For dict-encoded sort key columns, build sort-rank columns so that sorting
+    // on rank values produces the correct lexicographic string order.
+    // Keep temporary rank columns alive until after sort completes.
+    std::vector<ColumnPtr> rank_columns_holder;
     for (auto sort_key_idx : sort_key_idxes) {
-        columns.push_back(_chunk->get_column_by_index(sort_key_idx));
+        if (_dict_encoded_columns.count(sort_key_idx) > 0 && _global_dicts != nullptr) {
+            // Build sort-rank mapping: sort strings lexicographically, assign ranks
+            std::string col_name(_vectorized_schema->field(sort_key_idx)->name());
+            auto dict_it = _global_dicts->find(col_name);
+            DCHECK(dict_it != _global_dicts->end());
+            const auto& dict = dict_it->second.dict;
+
+            // Extract (string, code) pairs and sort by string
+            std::vector<std::pair<Slice, int32_t>> entries;
+            entries.reserve(dict.size());
+            for (auto& [slice, code] : dict) {
+                entries.emplace_back(slice, code);
+            }
+            std::sort(entries.begin(), entries.end(),
+                      [](const auto& a, const auto& b) { return a.first.compare(b.first) < 0; });
+
+            // Build rank_of[code] = rank
+            std::vector<int32_t> rank_of;
+            int32_t max_code = 0;
+            for (auto& [s, code] : entries) {
+                max_code = std::max(max_code, code);
+            }
+            rank_of.resize(max_code + 1, 0);
+            for (int32_t rank = 0; rank < (int32_t)entries.size(); rank++) {
+                rank_of[entries[rank].second] = rank;
+            }
+
+            // Create rank column from the code column
+            auto code_col = _chunk->get_column_by_index(sort_key_idx);
+            const Column* data_col = code_col.get();
+            const uint8_t* null_flags = nullptr;
+            if (code_col->is_nullable()) {
+                auto* nullable = down_cast<const NullableColumn*>(code_col.get());
+                data_col = nullable->data_column().get();
+                null_flags = nullable->null_column()->raw_data();
+            }
+            auto* int32_data = down_cast<const Int32Column*>(data_col);
+            auto rank_col = Int32Column::create();
+            rank_col->reserve(int32_data->size());
+            for (size_t row = 0; row < int32_data->size(); row++) {
+                int32_t code = int32_data->get_data()[row];
+                rank_col->append(rank_of[code]);
+            }
+            if (code_col->is_nullable()) {
+                auto* nullable = down_cast<const NullableColumn*>(code_col.get());
+                auto rank_nullable = NullableColumn::create(std::move(rank_col),
+                                                            nullable->null_column());
+                rank_columns_holder.push_back(rank_nullable);
+                columns.push_back(rank_columns_holder.back());
+            } else {
+                rank_columns_holder.push_back(std::move(rank_col));
+                columns.push_back(rank_columns_holder.back());
+            }
+        } else {
+            columns.push_back(_chunk->get_column_by_index(sort_key_idx));
+        }
     }
 
     auto sort_descs = SortDescs::asc_null_first(sort_key_idxes.size());

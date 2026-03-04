@@ -703,6 +703,9 @@ Status DeltaWriter::_reset_mem_table() {
         pk_encoding_type = PrimaryKeyEncodingType::PK_ENCODING_TYPE_V1;
     }
     RETURN_IF_ERROR(_mem_table->prepare(pk_encoding_type));
+    if (_opt.global_dicts != nullptr) {
+        _mem_table->set_global_dicts(_opt.global_dicts);
+    }
     _mem_table->set_write_buffer_row(_memtable_buffer_row);
     _write_buffer_size = _mem_table->write_buffer_size();
     return Status::OK();

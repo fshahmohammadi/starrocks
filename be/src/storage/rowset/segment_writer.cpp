@@ -42,11 +42,13 @@
 #include "column/binary_column.h"
 #include "column/chunk.h"
 #include "column/datum_tuple.h"
+#include "column/fixed_length_column.h"
 #include "column/nullable_column.h"
 #include "column/schema.h"
 #include "common/logging.h" // LOG
 #include "fs/fs.h"          // FileSystem
 #include "gen_cpp/segment.pb.h"
+#include "runtime/global_dict/decoder.h"
 #include "storage/chunk_variant_helper.h"
 #include "storage/index/index_descriptor.h"
 #include "storage/row_store_encoder.h"
@@ -210,6 +212,8 @@ Status SegmentWriter::init(const std::vector<uint32_t>& column_indexes, bool has
             if (iter != _opts.global_dicts->end()) {
                 opts.global_dict = &iter->second.dict;
                 _global_dict_columns_valid_info[iter->first] = true;
+                // Store dict pointer for lazy reverse dict building when dict-encoded input is detected
+                _global_dict_ptrs[i] = &iter->second.dict;
             }
         }
         if (column.type() == LogicalType::TYPE_JSON && _opts.global_dicts != nullptr) {
@@ -408,9 +412,29 @@ Status SegmentWriter::_write_raw_data(const std::vector<Slice>& slices) {
 Status SegmentWriter::append_chunk(const Chunk& chunk) {
     size_t chunk_num_rows = chunk.num_rows();
     size_t chunk_num_columns = chunk.num_columns();
+    // On first chunk, detect which columns have dict-encoded (Int32) input and lazily build reverse dicts
+    if (!_dict_columns_detected && !_global_dict_ptrs.empty()) {
+        _dict_columns_detected = true;
+        for (size_t i = 0; i < chunk_num_columns; ++i) {
+            auto it = _global_dict_ptrs.find(i);
+            if (it != _global_dict_ptrs.end() && _is_dict_encoded_input(chunk.get_column_raw_ptr_by_index(i))) {
+                RGlobalDictMap rmap;
+                for (auto& [slice, code] : *(it->second)) {
+                    rmap[code] = slice;
+                }
+                _reverse_global_dicts[i] = std::move(rmap);
+                _dict_encoded_column_indices.insert(i);
+            }
+        }
+    }
+
     for (size_t i = 0; i < chunk_num_columns; ++i) {
         const Column* col = chunk.get_column_raw_ptr_by_index(i);
-        RETURN_IF_ERROR(_column_writers[i]->append(*col));
+        if (_dict_encoded_column_indices.count(i) > 0) {
+            RETURN_IF_ERROR(_column_writers[i]->append_dict_codes(*col, _reverse_global_dicts[i]));
+        } else {
+            RETURN_IF_ERROR(_column_writers[i]->append(*col));
+        }
     }
 
     // TODO(cbl): put the fill full row column logic here is a bit hacky, this segment writer is used in many other
@@ -422,31 +446,89 @@ Status SegmentWriter::append_chunk(const Chunk& chunk) {
         // just missing full row column, generate it and write to file
         auto full_row_col = BinaryColumn::create();
         auto row_encoder = RowStoreEncoderFactory::instance()->get_or_create_encoder(SIMPLE);
-        RETURN_IF_ERROR(row_encoder->encode_chunk_to_full_row_column(*_schema_without_full_row_column, chunk,
-                                                                     full_row_col.get()));
+        if (!_dict_encoded_column_indices.empty()) {
+            // Decode dict-encoded columns to strings for full row encoding.
+            // Uses batch decode_dict_column_to_string() following the read path pattern.
+            auto decoded_chunk = chunk.clone_unique();
+            for (uint32_t idx : _dict_encoded_column_indices) {
+                const Column* src = chunk.get_column_raw_ptr_by_index(idx);
+                decoded_chunk->update_column_by_index(
+                        decode_dict_column_to_string(*src, _reverse_global_dicts[idx]), idx);
+            }
+            RETURN_IF_ERROR(row_encoder->encode_chunk_to_full_row_column(*_schema_without_full_row_column,
+                                                                         *decoded_chunk, full_row_col.get()));
+        } else {
+            RETURN_IF_ERROR(row_encoder->encode_chunk_to_full_row_column(*_schema_without_full_row_column, chunk,
+                                                                         full_row_col.get()));
+        }
         RETURN_IF_ERROR(_column_writers[chunk_num_columns]->append(*full_row_col));
     } else {
         DCHECK_EQ(_column_writers.size(), chunk_num_columns);
     }
 
     if (_has_key) {
-        if (chunk_num_rows > 0) {
-            if (_sort_key_min.empty()) {
-                // The append_chunk is ordered, so the first is min
-                _sort_key_min = build_variant_tuple_from_chunk_row(chunk, 0, _sort_column_indexes);
+        // Check if any sort key columns are dict-encoded (need decoded values for index)
+        bool has_dict_sort_keys = false;
+        if (!_dict_encoded_column_indices.empty()) {
+            for (uint32_t idx : _sort_column_indexes) {
+                if (_dict_encoded_column_indices.count(idx) > 0) {
+                    has_dict_sort_keys = true;
+                    break;
+                }
             }
-            // The append_chunk is ordered, so the last is max
-            _sort_key_max = build_variant_tuple_from_chunk_row(chunk, chunk_num_rows - 1, _sort_column_indexes);
+        }
+
+        if (chunk_num_rows > 0) {
+            if (has_dict_sort_keys) {
+                // Build variant tuples with decoded dict values for sort key min/max
+                auto build_decoded_variant_tuple = [&](size_t row_idx) -> VariantTuple {
+                    const auto& schema = chunk.schema();
+                    VariantTuple tuple;
+                    tuple.reserve(_sort_column_indexes.size());
+                    for (uint32_t col_idx : _sort_column_indexes) {
+                        if (_dict_encoded_column_indices.count(col_idx) > 0) {
+                            const Column* col = chunk.get_column_raw_ptr_by_index(col_idx);
+                            tuple.emplace(schema->field(col_idx)->type(), _decode_dict_datum(col_idx, col, row_idx));
+                        } else {
+                            tuple.emplace(schema->field(col_idx)->type(),
+                                          chunk.get_column_by_index(col_idx)->get(row_idx));
+                        }
+                    }
+                    return tuple;
+                };
+                if (_sort_key_min.empty()) {
+                    _sort_key_min = build_decoded_variant_tuple(0);
+                }
+                _sort_key_max = build_decoded_variant_tuple(chunk_num_rows - 1);
+            } else {
+                if (_sort_key_min.empty()) {
+                    _sort_key_min = build_variant_tuple_from_chunk_row(chunk, 0, _sort_column_indexes);
+                }
+                _sort_key_max = build_variant_tuple_from_chunk_row(chunk, chunk_num_rows - 1, _sort_column_indexes);
+            }
         }
 
         for (size_t i = 0; i < chunk_num_rows; i++) {
             // At the begin of one block, so add a short key index entry
             if ((_num_rows_written % _opts.num_rows_per_block) == 0) {
                 size_t keys = _tablet_schema->num_short_key_columns();
-                SeekTuple tuple(*chunk.schema(), chunk.get(i).datums());
-                std::string encoded_key;
-                encoded_key = tuple.short_key_encode(keys, _sort_column_indexes, 0);
-                RETURN_IF_ERROR(_index_builder->add_item(encoded_key));
+                if (has_dict_sort_keys) {
+                    // Build datums with decoded dict values for short key encoding
+                    std::vector<Datum> datums = chunk.get(i).datums();
+                    for (uint32_t col_idx : _sort_column_indexes) {
+                        if (_dict_encoded_column_indices.count(col_idx) > 0 && col_idx < datums.size()) {
+                            const Column* col = chunk.get_column_raw_ptr_by_index(col_idx);
+                            datums[col_idx] = _decode_dict_datum(col_idx, col, i);
+                        }
+                    }
+                    SeekTuple tuple(*chunk.schema(), std::move(datums));
+                    std::string encoded_key = tuple.short_key_encode(keys, _sort_column_indexes, 0);
+                    RETURN_IF_ERROR(_index_builder->add_item(encoded_key));
+                } else {
+                    SeekTuple tuple(*chunk.schema(), chunk.get(i).datums());
+                    std::string encoded_key = tuple.short_key_encode(keys, _sort_column_indexes, 0);
+                    RETURN_IF_ERROR(_index_builder->add_item(encoded_key));
+                }
             }
             ++_num_rows_written;
         }
@@ -472,6 +554,31 @@ int64_t SegmentWriter::bundle_file_offset() const {
 
 StatusOr<std::unique_ptr<io::NumericStatistics>> SegmentWriter::get_numeric_statistics() {
     return _wfile->get_numeric_statistics();
+}
+
+bool SegmentWriter::_is_dict_encoded_input(const Column* col) {
+    const Column* data_col = col;
+    if (col->is_nullable()) {
+        data_col = down_cast<const NullableColumn*>(col)->data_column().get();
+    }
+    // Dict-encoded columns arrive as Int32Column (numeric), not BinaryColumn (binary)
+    return data_col->is_numeric();
+}
+
+Datum SegmentWriter::_decode_dict_datum(uint32_t col_idx, const Column* col, size_t row_idx) const {
+    if (col->is_nullable()) {
+        auto* nullable = down_cast<const NullableColumn*>(col);
+        if (nullable->is_null(row_idx)) {
+            return {};
+        }
+        col = nullable->data_column().get();
+    }
+    auto* int_col = down_cast<const Int32Column*>(col);
+    int32_t code = int_col->get_data()[row_idx];
+    auto& rdict = _reverse_global_dicts.at(col_idx);
+    auto it = rdict.find(code);
+    DCHECK(it != rdict.end());
+    return Datum(it->second);
 }
 
 void SegmentWriter::_check_column_global_dict_valid(ColumnWriter* column_writer, uint32_t column_index) {

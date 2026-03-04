@@ -41,6 +41,7 @@
 #include "base/phmap/phmap.h"
 #include "gen_cpp/segment.pb.h"
 #include "gutil/hash/string_hash.h"
+#include "runtime/global_dict/types_fwd_decl.h"
 #include "runtime/mem_pool.h"
 #include "storage/olap_common.h"
 #include "storage/range.h"
@@ -85,6 +86,10 @@ public:
 
     bool is_valid_global_dict(const GlobalDictMap* global_dict) const override;
 
+    // Add data from global dict codes directly, mapping global codes to local codes.
+    // Returns number of codes successfully added.
+    uint32_t add_dict_codes(const int32_t* global_codes, uint32_t count, const RGlobalDictMap& reverse_dict);
+
     // Return true iff all pages so far are encoded by dictionary encoding.
     // this method normally should be called after all data pages finish
     // write, i.e, after `finish` has been called.
@@ -117,6 +122,8 @@ private:
     EncodingTypePB _encoding_type;
     // query for dict item -> dict id
     phmap::flat_hash_map<std::string, uint32_t, HashOfSlice, Eq> _dictionary;
+    // global dict code -> local dict code mapping (used by add_dict_codes)
+    phmap::flat_hash_map<int32_t, uint32_t> _global_to_local;
     faststring _first_value;
 };
 

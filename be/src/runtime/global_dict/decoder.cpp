@@ -17,8 +17,10 @@
 #include <utility>
 
 #include "column/array_column.h"
+#include "column/binary_column.h"
 #include "column/column_builder.h"
 #include "column/const_column.h"
+#include "column/fixed_length_column.h"
 #include "column/nullable_column.h"
 #include "column/type_traits.h"
 #include "column/vectorized_fwd.h"
@@ -29,6 +31,50 @@
 #include "types/type_descriptor.h"
 
 namespace starrocks {
+
+ColumnPtr decode_dict_column_to_string(const Column& dict_column, const RGlobalDictMap& reverse_dict) {
+    if (!dict_column.is_nullable()) {
+        const auto* int_col = down_cast<const Int32Column*>(&dict_column);
+        const auto& data = int_col->get_data();
+        const size_t num_rows = data.size();
+
+        std::vector<Slice> slices(num_rows);
+        for (size_t i = 0; i < num_rows; i++) {
+            auto it = reverse_dict.find(data[i]);
+            DCHECK(it != reverse_dict.end());
+            slices[i] = it->second;
+        }
+
+        auto str_col = BinaryColumn::create();
+        str_col->append_strings(slices.data(), num_rows);
+        return str_col;
+    }
+
+    const auto* nullable = down_cast<const NullableColumn*>(&dict_column);
+    const auto* int_col = down_cast<const Int32Column*>(nullable->data_column().get());
+    const auto& data = int_col->get_data();
+    const auto& null_data = nullable->null_column_data();
+    const size_t num_rows = data.size();
+
+    std::vector<Slice> slices(num_rows);
+    for (size_t i = 0; i < num_rows; i++) {
+        if (null_data[i] == 0) {
+            auto it = reverse_dict.find(data[i]);
+            DCHECK(it != reverse_dict.end());
+            slices[i] = it->second;
+        }
+    }
+
+    auto str_col = BinaryColumn::create();
+    str_col->append_strings(slices.data(), num_rows);
+
+    auto null_col = NullColumn::create();
+    null_col->get_data().assign(null_data.begin(), null_data.end());
+
+    auto result = NullableColumn::create(std::move(str_col), std::move(null_col));
+    result->set_has_null(nullable->has_null());
+    return result;
+}
 
 template <typename Dict>
 class GlobalDictDecoderBase : public GlobalDictDecoder {
