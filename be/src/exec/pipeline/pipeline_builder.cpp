@@ -375,6 +375,12 @@ OpFactories PipelineBuilderContext::maybe_gather_pipelines_to_one(RuntimeState* 
         max_input_dop += source_op->degree_of_parallelism();
     }
 
+    // Cap buffer sizing by consumer DOP to avoid over-allocation in UNION ALL
+    // with many branches (e.g., 5 branches × DOP 16 = 80, but only 16 consumers).
+    if (config::local_exchange_buffer_mem_limit_by_consumer_dop) {
+        max_input_dop = std::min(max_input_dop, degree_of_parallelism());
+    }
+
     auto mem_mgr = std::make_shared<ChunkBufferMemoryManager>(max_input_dop,
                                                               config::local_exchange_buffer_mem_limit_per_driver);
     auto local_exchange_source =
