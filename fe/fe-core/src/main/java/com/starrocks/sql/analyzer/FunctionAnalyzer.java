@@ -1360,7 +1360,7 @@ public class FunctionAnalyzer {
             ((AggregateFunction) fn).setIsAscOrder(isAscOrder);
             ((AggregateFunction) fn).setNullsFirst(nullsFirst);
             ((AggregateFunction) fn).setIntermediateType(VarbinaryType.VARBINARY);
-            fn.setFunctionName(new FunctionName("multi_array_agg_v2"));
+            fn.setFunctionName(new FunctionName(FunctionSet.MULTI_ARRAY_AGG_V2));
         } else if (FunctionSet.MIN_N.equalsIgnoreCase(fnName) || FunctionSet.MAX_N.equalsIgnoreCase(fnName)) {
             // min_n/max_n(value, n) returns array<value_type>
             // Normalize second argument to INT (handles TINYINT/SMALLINT from literals like '3')

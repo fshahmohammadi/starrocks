@@ -71,6 +71,7 @@ public class DecimalV3FunctionAnalyzer {
                     .add(FunctionSet.ARRAY_AGG)
                     .add(FunctionSet.ARRAY_AGG_DISTINCT)
                     .add(FunctionSet.MULTI_ARRAY_AGG)
+                    .add(FunctionSet.MULTI_ARRAY_AGG_V2)
                     .build();
 
     public static final Set<String> DECIMAL_AGG_FUNCTION_SAME_TYPE =
