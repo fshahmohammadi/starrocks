@@ -1359,12 +1359,8 @@ public class FunctionAnalyzer {
             fn.setRetType(returnType);
             ((AggregateFunction) fn).setIsAscOrder(isAscOrder);
             ((AggregateFunction) fn).setNullsFirst(nullsFirst);
-            if (ConnectContext.get() != null &&
-                    ConnectContext.get().getSessionVariable().isEnableMultiArrayAggV2()) {
-                // V2 intermediate type: VARBINARY blob
-                ((AggregateFunction) fn).setIntermediateType(VarbinaryType.VARBINARY);
-                fn.setFunctionName(new FunctionName("multi_array_agg_v2"));
-            }
+            ((AggregateFunction) fn).setIntermediateType(VarbinaryType.VARBINARY);
+            fn.setFunctionName(new FunctionName("multi_array_agg_v2"));
         } else if (FunctionSet.MIN_N.equalsIgnoreCase(fnName) || FunctionSet.MAX_N.equalsIgnoreCase(fnName)) {
             // min_n/max_n(value, n) returns array<value_type>
             // Normalize second argument to INT (handles TINYINT/SMALLINT from literals like '3')
