@@ -1323,9 +1323,10 @@ public class FunctionAnalyzer {
             }
             // need to distinct output columns in finalize phase
             ((AggregateFunction) fn).setIsDistinct(isDistinct && (!isAscOrder.isEmpty() || outputConst));
-        } else if (fnName.equals(FunctionSet.MULTI_ARRAY_AGG)) {
+        } else if (fnName.equals(FunctionSet.MULTI_ARRAY_AGG)
+                || fnName.equals(FunctionSet.MULTI_ARRAY_AGG_V2)) {
             if (isDistinct) {
-                throw new SemanticException("DISTINCT is not supported for multi_array_agg", pos);
+                throw new SemanticException("DISTINCT is not supported for " + fnName, pos);
             }
             fn = ExprUtils.getBuiltinFunction(fnName, new Type[] {argumentTypes[0]},
                     Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
@@ -1342,7 +1343,7 @@ public class FunctionAnalyzer {
             int numOrderBy = isAscOrder.size();
             int numAggCols = argSize - numOrderBy;
             if (numAggCols < 1) {
-                throw new SemanticException("multi_array_agg requires at least one aggregation column", pos);
+                throw new SemanticException(fnName + " requires at least one aggregation column", pos);
             }
             // Normalize argument types (NULL -> BOOLEAN)
             Type[] argsTypes = new Type[argSize];
