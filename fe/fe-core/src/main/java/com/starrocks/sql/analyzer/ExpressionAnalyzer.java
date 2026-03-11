@@ -1301,7 +1301,9 @@ public class ExpressionAnalyzer {
                     }
                     break;
                 case FunctionSet.GROUP_CONCAT:
-                case FunctionSet.ARRAY_AGG: {
+                case FunctionSet.ARRAY_AGG:
+                case FunctionSet.MULTI_ARRAY_AGG:
+                case FunctionSet.MULTI_ARRAY_AGG_V2: {
                     if (node.getChildren().size() == 0) {
                         throw new SemanticException(fnName + " should have at least one input", node.getPos());
                     }
@@ -1317,6 +1319,10 @@ public class ExpressionAnalyzer {
 
                     } else if (fnName.equals(FunctionSet.ARRAY_AGG) && start != 1) {
                         throw new SemanticException(fnName + " should have exact one output expressions before" +
+                                " [ORDER BY]", node.getPos());
+                    } else if ((fnName.equals(FunctionSet.MULTI_ARRAY_AGG)
+                            || fnName.equals(FunctionSet.MULTI_ARRAY_AGG_V2)) && start < 1) {
+                        throw new SemanticException(fnName + " should have at least one output expression before" +
                                 " [ORDER BY]", node.getPos());
                     }
                     for (int i = start; i < argumentTypes.length; ++i) {
