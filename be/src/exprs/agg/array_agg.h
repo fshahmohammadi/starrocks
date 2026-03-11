@@ -267,6 +267,42 @@ using ArrayAggAggregateFunction = ArrayAggAggregateFunctionBase<LT, is_distinct,
 template <LogicalType LT, bool is_distinct, typename MyHashSet = std::set<int>>
 using ArrayAggAggregateWindowFunction = ArrayAggAggregateFunctionBase<LT, is_distinct, ArrayAggWindowState, MyHashSet>;
 
+// Shared state stored in FunctionContext::THREAD_LOCAL, shared across all groups for one driver.
+// Instead of creating N Column objects per group, we maintain shared columns that all groups
+// append into, with each group tracking only its row indices.
+struct ArrayAggSharedState {
+    MutableColumns shared_columns;
+    int64_t shared_mem_usage = 0;
+    int32_t ref_count = 0;
+
+    void initialize(FunctionContext* ctx) {
+        for (size_t i = 0; i < ctx->get_arg_types().size(); ++i) {
+            shared_columns.emplace_back(FunctionHelper::create_column(*ctx->get_arg_type(i), true));
+        }
+    }
+
+    int64_t mem_usage() const {
+        int64_t usage = 0;
+        for (const auto& col : shared_columns) {
+            if (col != nullptr) {
+                usage += static_cast<int64_t>(col->memory_usage());
+            }
+        }
+        return usage;
+    }
+};
+
+// Per-group state that stores only row indices into the shared columns.
+// With ~3 rows/group average, this saves ~3200 bytes/group in Column object overhead
+// while adding only ~36 bytes for the index vector.
+struct ArrayAggAggregateStateV2Shared {
+    mutable std::vector<uint32_t> row_indices;
+
+    int64_t mem_usage() const {
+        return static_cast<int64_t>(row_indices.capacity() * sizeof(uint32_t));
+    }
+};
+
 // input columns result in intermediate result: struct{array[col0], array[col1], array[col2]... array[coln]}
 // return ordered array[col0']
 struct ArrayAggAggregateStateV2 {
@@ -347,80 +383,194 @@ class ArrayAggAggregateFunctionV2 final
 public:
     void create(FunctionContext* ctx, AggDataPtr __restrict ptr) const override {
         auto* state = new (ptr) AggState;
-        state->initialize(ctx);
+        if constexpr (std::is_same_v<AggState, ArrayAggAggregateStateV2Shared>) {
+            auto* shared = reinterpret_cast<ArrayAggSharedState*>(
+                    ctx->get_function_state(FunctionContext::THREAD_LOCAL));
+            if (shared == nullptr) {
+                shared = new ArrayAggSharedState();
+                shared->initialize(ctx);
+                ctx->set_function_state(FunctionContext::THREAD_LOCAL, shared);
+            }
+            shared->ref_count++;
+        } else {
+            state->initialize(ctx);
+        }
+    }
+
+    void destroy(FunctionContext* ctx, AggDataPtr __restrict ptr) const override {
+        if constexpr (std::is_same_v<AggState, ArrayAggAggregateStateV2Shared>) {
+            auto* shared = reinterpret_cast<ArrayAggSharedState*>(
+                    ctx->get_function_state(FunctionContext::THREAD_LOCAL));
+            if (shared != nullptr) {
+                shared->ref_count--;
+                if (shared->ref_count <= 0) {
+                    delete shared;
+                    ctx->set_function_state(FunctionContext::THREAD_LOCAL, nullptr);
+                }
+            }
+        }
+        this->data(ptr).~AggState();
     }
 
     void update(FunctionContext* ctx, const Column** columns, AggDataPtr __restrict state,
                 size_t row_num) const override {
-        for (auto i = 0; i < ctx->get_num_args(); ++i) {
-            if (UNLIKELY(columns[i]->size() <= row_num)) {
-                ctx->set_error(std::string(get_name() + "'s update row number overflow").c_str(), false);
-                return;
+        if constexpr (std::is_same_v<AggState, ArrayAggAggregateStateV2Shared>) {
+            auto* shared = reinterpret_cast<ArrayAggSharedState*>(
+                    ctx->get_function_state(FunctionContext::THREAD_LOCAL));
+            DCHECK(shared != nullptr);
+            auto& state_impl = this->data(state);
+
+            uint32_t shared_row = static_cast<uint32_t>(shared->shared_columns[0]->size());
+            for (auto i = 0; i < ctx->get_num_args(); ++i) {
+                if (UNLIKELY(columns[i]->size() <= row_num)) {
+                    ctx->set_error(std::string(get_name() + "'s update row number overflow").c_str(), false);
+                    return;
+                }
+                if ((columns[i]->is_nullable() && columns[i]->is_null(row_num)) || columns[i]->only_null()) {
+                    shared->shared_columns[i]->append_nulls(1);
+                    continue;
+                }
+                auto* data_col = columns[i];
+                auto tmp_row_num = row_num;
+                if (columns[i]->is_constant()) {
+                    data_col = down_cast<const ConstColumn*>(columns[i])->data_column().get();
+                    tmp_row_num = 0;
+                }
+                shared->shared_columns[i]->append(*data_col, tmp_row_num, 1);
             }
-            // TODO: update is random access, so we could not pre-reserve memory for State, which is the bottleneck
-            if ((columns[i]->is_nullable() && columns[i]->is_null(row_num)) || columns[i]->only_null()) {
-                this->data(state).update_nulls(i, 1);
-                continue;
+            state_impl.row_indices.push_back(shared_row);
+        } else {
+            for (auto i = 0; i < ctx->get_num_args(); ++i) {
+                if (UNLIKELY(columns[i]->size() <= row_num)) {
+                    ctx->set_error(std::string(get_name() + "'s update row number overflow").c_str(), false);
+                    return;
+                }
+                // TODO: update is random access, so we could not pre-reserve memory for State, which is the bottleneck
+                if ((columns[i]->is_nullable() && columns[i]->is_null(row_num)) || columns[i]->only_null()) {
+                    this->data(state).update_nulls(i, 1);
+                    continue;
+                }
+                auto* data_col = columns[i];
+                auto tmp_row_num = row_num;
+                if (columns[i]->is_constant()) {
+                    // just copy the first const value.
+                    data_col = down_cast<const ConstColumn*>(columns[i])->data_column().get();
+                    tmp_row_num = 0;
+                }
+                this->data(state).update(*data_col, i, tmp_row_num, 1);
             }
-            auto* data_col = columns[i];
-            auto tmp_row_num = row_num;
-            if (columns[i]->is_constant()) {
-                // just copy the first const value.
-                data_col = down_cast<const ConstColumn*>(columns[i])->data_column().get();
-                tmp_row_num = 0;
-            }
-            this->data(state).update(*data_col, i, tmp_row_num, 1);
         }
     }
 
     // struct and array elements aren't be null, as they consist from several columns
     void merge(FunctionContext* ctx, const Column* column, AggDataPtr __restrict state, size_t row_num) const override {
-        const auto input_columns = down_cast<const StructColumn*>(ColumnHelper::get_data_column(column))->fields();
-        for (auto i = 0; i < input_columns.size(); ++i) {
-            auto array_column = down_cast<const ArrayColumn*>(ColumnHelper::get_data_column(input_columns[i].get()));
-            const auto offsets = array_column->offsets().immutable_data();
-            this->data(state).update(array_column->elements(), i, offsets[row_num],
-                                     offsets[row_num + 1] - offsets[row_num]);
+        if constexpr (std::is_same_v<AggState, ArrayAggAggregateStateV2Shared>) {
+            auto* shared = reinterpret_cast<ArrayAggSharedState*>(
+                    ctx->get_function_state(FunctionContext::THREAD_LOCAL));
+            DCHECK(shared != nullptr);
+            auto& state_impl = this->data(state);
+
+            const auto input_columns =
+                    down_cast<const StructColumn*>(ColumnHelper::get_data_column(column))->fields();
+            uint32_t shared_row_start = static_cast<uint32_t>(shared->shared_columns[0]->size());
+            uint32_t num_rows = 0;
+            for (size_t i = 0; i < input_columns.size(); ++i) {
+                auto array_column =
+                        down_cast<const ArrayColumn*>(ColumnHelper::get_data_column(input_columns[i].get()));
+                const auto offsets = array_column->offsets().immutable_data();
+                auto offset = offsets[row_num];
+                auto count = offsets[row_num + 1] - offsets[row_num];
+                shared->shared_columns[i]->append(array_column->elements(), offset, count);
+                if (i == 0) {
+                    num_rows = count;
+                }
+            }
+            for (uint32_t j = 0; j < num_rows; ++j) {
+                state_impl.row_indices.push_back(shared_row_start + j);
+            }
+        } else {
+            const auto input_columns =
+                    down_cast<const StructColumn*>(ColumnHelper::get_data_column(column))->fields();
+            for (auto i = 0; i < input_columns.size(); ++i) {
+                auto array_column =
+                        down_cast<const ArrayColumn*>(ColumnHelper::get_data_column(input_columns[i].get()));
+                const auto offsets = array_column->offsets().immutable_data();
+                this->data(state).update(array_column->elements(), i, offsets[row_num],
+                                         offsets[row_num + 1] - offsets[row_num]);
+            }
         }
     }
 
     // serialize each state->column to a [nullable] array in a [nullable] struct
     void serialize_to_column(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* to) const override {
-        auto& state_impl = this->data(const_cast<AggDataPtr>(state));
-        // should check overflow before append, otherwise will generate invalid result.
-        if (UNLIKELY(state_impl.check_overflow(ctx))) {
-            return;
-        }
+        if constexpr (std::is_same_v<AggState, ArrayAggAggregateStateV2Shared>) {
+            auto& state_impl = this->data(const_cast<AggDataPtr>(state));
+            auto* shared = reinterpret_cast<ArrayAggSharedState*>(
+                    ctx->get_function_state(FunctionContext::THREAD_LOCAL));
+            DCHECK(shared != nullptr);
 
-        auto* struct_column = down_cast<StructColumn*>(ColumnHelper::get_data_column(to));
-        if (to->is_nullable()) {
-            down_cast<NullableColumn*>(to)->null_column_data().emplace_back(0);
-        }
-        for (auto i = 0; i < struct_column->fields_size(); ++i) {
-            auto elem_size = state_impl.data_columns[i]->size();
-
-            auto* field_column = struct_column->field_column_raw_ptr(i);
-            auto array_col = down_cast<ArrayColumn*>(ColumnHelper::get_data_column(field_column));
-            if (field_column->is_nullable()) {
-                down_cast<NullableColumn*>(field_column)->null_column_data().emplace_back(0);
+            auto* struct_column = down_cast<StructColumn*>(ColumnHelper::get_data_column(to));
+            if (to->is_nullable()) {
+                down_cast<NullableColumn*>(to)->null_column_data().emplace_back(0);
             }
-            auto* elements_col = array_col->elements_column_raw_ptr();
-            auto* offsets_col = array_col->offsets_column_raw_ptr();
-            if (state_impl.data_columns[i]->only_null()) {
-                elements_col->append_nulls(elem_size);
-            } else {
-                elements_col->append(
-                        *ColumnHelper::unpack_and_duplicate_const_column(elem_size, state_impl.data_columns[i]), 0,
-                        elem_size);
-            }
-            offsets_col->append(offsets_col->immutable_data().back() + elem_size);
-            state_impl.data_columns[i].reset();
-        }
-        state_impl.data_columns.clear();
 
-        // should check overflow after append, otherwise the result column with multi row will be overflow.
-        if (UNLIKELY(state_impl.check_overflow(*to, ctx))) {
-            return;
+            auto elem_size = state_impl.row_indices.size();
+            for (size_t i = 0; i < struct_column->fields_size(); ++i) {
+                auto* field_column = struct_column->field_column_raw_ptr(i);
+                auto array_col = down_cast<ArrayColumn*>(ColumnHelper::get_data_column(field_column));
+                if (field_column->is_nullable()) {
+                    down_cast<NullableColumn*>(field_column)->null_column_data().emplace_back(0);
+                }
+                auto* elements_col = array_col->elements_column_raw_ptr();
+                auto* offsets_col = array_col->offsets_column_raw_ptr();
+                if (elem_size > 0) {
+                    elements_col->append_selective(*shared->shared_columns[i], state_impl.row_indices);
+                }
+                offsets_col->append(offsets_col->immutable_data().back() + static_cast<uint32_t>(elem_size));
+            }
+            state_impl.row_indices.clear();
+            state_impl.row_indices.shrink_to_fit();
+
+            if (UNLIKELY(ArrayAggAggregateStateV2::check_overflow(*to, ctx))) {
+                return;
+            }
+        } else {
+            auto& state_impl = this->data(const_cast<AggDataPtr>(state));
+            // should check overflow before append, otherwise will generate invalid result.
+            if (UNLIKELY(state_impl.check_overflow(ctx))) {
+                return;
+            }
+
+            auto* struct_column = down_cast<StructColumn*>(ColumnHelper::get_data_column(to));
+            if (to->is_nullable()) {
+                down_cast<NullableColumn*>(to)->null_column_data().emplace_back(0);
+            }
+            for (auto i = 0; i < struct_column->fields_size(); ++i) {
+                auto elem_size = state_impl.data_columns[i]->size();
+
+                auto* field_column = struct_column->field_column_raw_ptr(i);
+                auto array_col = down_cast<ArrayColumn*>(ColumnHelper::get_data_column(field_column));
+                if (field_column->is_nullable()) {
+                    down_cast<NullableColumn*>(field_column)->null_column_data().emplace_back(0);
+                }
+                auto* elements_col = array_col->elements_column_raw_ptr();
+                auto* offsets_col = array_col->offsets_column_raw_ptr();
+                if (state_impl.data_columns[i]->only_null()) {
+                    elements_col->append_nulls(elem_size);
+                } else {
+                    elements_col->append(
+                            *ColumnHelper::unpack_and_duplicate_const_column(elem_size, state_impl.data_columns[i]),
+                            0, elem_size);
+                }
+                offsets_col->append(offsets_col->immutable_data().back() + elem_size);
+                state_impl.data_columns[i].reset();
+            }
+            state_impl.data_columns.clear();
+
+            // should check overflow after append, otherwise the result column with multi row will be overflow.
+            if (UNLIKELY(state_impl.check_overflow(*to, ctx))) {
+                return;
+            }
         }
     }
 
@@ -438,102 +588,203 @@ public:
                            false);
             return;
         }
-        auto& state_impl = this->data(const_cast<AggDataPtr>(state));
-        // should check overflow before append, otherwise will generate invalid result.
-        if (UNLIKELY(state_impl.check_overflow(ctx))) {
-            return;
-        }
-        auto& res = state_impl.data_columns[0];
-        auto elem_size = state_impl.data_columns[0]->size();
-        auto array_col = down_cast<ArrayColumn*>(ColumnHelper::get_data_column(to));
-        if (to->is_nullable()) {
-            down_cast<NullableColumn*>(to)->null_column_data().emplace_back(0);
-        }
-        DCHECK(!res->is_constant());
-        Permutation perm;
-        if (!ctx->get_is_asc_order().empty()) {
-            Columns order_by_columns;
-            SortDescs sort_desc(ctx->get_is_asc_order(), ctx->get_nulls_first());
-            order_by_columns.assign(state_impl.data_columns.begin() + 1, state_impl.data_columns.end());
-            Status st = sort_and_tie_columns(ctx->state()->cancelled_ref(), order_by_columns, sort_desc, &perm);
-            // release order-by columns early
-            order_by_columns.clear();
+
+        if constexpr (std::is_same_v<AggState, ArrayAggAggregateStateV2Shared>) {
+            auto& state_impl = this->data(const_cast<AggDataPtr>(state));
+            auto* shared = reinterpret_cast<ArrayAggSharedState*>(
+                    ctx->get_function_state(FunctionContext::THREAD_LOCAL));
+            DCHECK(shared != nullptr);
+
+            // Extract this group's rows from shared columns into temporary columns
+            size_t num_args = shared->shared_columns.size();
+            MutableColumns tmp_columns;
+            tmp_columns.reserve(num_args);
+            for (size_t i = 0; i < num_args; ++i) {
+                tmp_columns.emplace_back(shared->shared_columns[i]->clone_empty());
+                if (!state_impl.row_indices.empty()) {
+                    tmp_columns[i]->append_selective(*shared->shared_columns[i], state_impl.row_indices);
+                }
+            }
+            state_impl.row_indices.clear();
+            state_impl.row_indices.shrink_to_fit();
+
+            auto& res = tmp_columns[0];
+            auto elem_size = res->size();
+            auto array_col = down_cast<ArrayColumn*>(ColumnHelper::get_data_column(to));
+            if (to->is_nullable()) {
+                down_cast<NullableColumn*>(to)->null_column_data().emplace_back(0);
+            }
+            Permutation perm;
+            if (!ctx->get_is_asc_order().empty()) {
+                Columns order_by_columns;
+                SortDescs sort_desc(ctx->get_is_asc_order(), ctx->get_nulls_first());
+                order_by_columns.assign(tmp_columns.begin() + 1, tmp_columns.end());
+                Status st =
+                        sort_and_tie_columns(ctx->state()->cancelled_ref(), order_by_columns, sort_desc, &perm);
+                order_by_columns.clear();
+                if (UNLIKELY(ctx->state()->cancelled_ref())) {
+                    ctx->set_error("array_agg detects cancelled.", false);
+                    return;
+                }
+                if (UNLIKELY(!st.ok())) {
+                    ctx->set_error(st.to_string().c_str(), false);
+                    return;
+                }
+            }
+            Buffer<bool> duplicated_flags;
+            if (ctx->get_is_distinct()) {
+                duplicated_flags.resize(elem_size);
+                bool is_duplicated = false;
+                phmap::flat_hash_set<uint32_t> sets;
+                std::vector<uint32_t> hash(elem_size, 0);
+                res->fnv_hash(hash.data(), 0, elem_size);
+                for (size_t row_id = 0; row_id < elem_size; row_id++) {
+                    is_duplicated = false;
+                    if (!sets.contains(hash[row_id])) {
+                        sets.emplace(hash[row_id]);
+                    } else {
+                        for (size_t next_id = 0; next_id < row_id; next_id++) {
+                            if (hash[row_id] == hash[next_id] && res->equals(next_id, *res, row_id)) {
+                                is_duplicated = true;
+                                break;
+                            }
+                        }
+                    }
+                    duplicated_flags[row_id] = is_duplicated;
+                }
+            }
+            Buffer<uint32_t> index;
+            if (!duplicated_flags.empty() || !perm.empty()) {
+                size_t res_num = 0;
+                index.resize(elem_size);
+                for (size_t row_id = 0; row_id < elem_size; row_id++) {
+                    if (duplicated_flags.empty()) {
+                        index[res_num++] = perm[row_id].index_in_chunk;
+                    } else {
+                        if (perm.empty()) {
+                            if (!duplicated_flags[row_id]) {
+                                index[res_num++] = row_id;
+                            }
+                        } else {
+                            if (!duplicated_flags[perm[row_id].index_in_chunk]) {
+                                index[res_num++] = perm[row_id].index_in_chunk;
+                            }
+                        }
+                    }
+                }
+                index.resize(res_num);
+                elem_size = res_num;
+            }
+            auto* elements_col = array_col->elements_column_raw_ptr();
+            if (index.empty()) {
+                elements_col->append(*res, 0, elem_size);
+            } else {
+                elements_col->append_selective(*res, index);
+            }
+            auto* offsets_col = array_col->offsets_column_raw_ptr();
+            offsets_col->append(offsets_col->immutable_data().back() + elem_size);
+            if (UNLIKELY(ArrayAggAggregateStateV2::check_overflow(*to, ctx))) {
+                return;
+            }
+        } else {
+            auto& state_impl = this->data(const_cast<AggDataPtr>(state));
+            // should check overflow before append, otherwise will generate invalid result.
+            if (UNLIKELY(state_impl.check_overflow(ctx))) {
+                return;
+            }
+            auto& res = state_impl.data_columns[0];
+            auto elem_size = state_impl.data_columns[0]->size();
+            auto array_col = down_cast<ArrayColumn*>(ColumnHelper::get_data_column(to));
+            if (to->is_nullable()) {
+                down_cast<NullableColumn*>(to)->null_column_data().emplace_back(0);
+            }
+            DCHECK(!res->is_constant());
+            Permutation perm;
+            if (!ctx->get_is_asc_order().empty()) {
+                Columns order_by_columns;
+                SortDescs sort_desc(ctx->get_is_asc_order(), ctx->get_nulls_first());
+                order_by_columns.assign(state_impl.data_columns.begin() + 1, state_impl.data_columns.end());
+                Status st =
+                        sort_and_tie_columns(ctx->state()->cancelled_ref(), order_by_columns, sort_desc, &perm);
+                // release order-by columns early
+                order_by_columns.clear();
+                // for window function, we can not clear State::data_columns, since its data are used to produce
+                // result,for an example: array_agg(c) over(partition by a order by b)
+                if constexpr (!std::is_same_v<AggState, ArrayAggWindowStateV2>) {
+                    state_impl.release_order_by_columns();
+                }
+                if (UNLIKELY(ctx->state()->cancelled_ref())) {
+                    ctx->set_error("array_agg detects cancelled.", false);
+                    return;
+                }
+                if (UNLIKELY(!st.ok())) {
+                    ctx->set_error(st.to_string().c_str(), false);
+                    return;
+                }
+            }
+            // further remove duplicated values
+            // TODO(fzh) optimize N*N, since distinct is often rewritten to group by, the distinct values are not too many.
+            Buffer<bool> duplicated_flags;
+            if (ctx->get_is_distinct()) {
+                duplicated_flags.resize(elem_size);
+                bool is_duplicated = false;
+                phmap::flat_hash_set<uint32_t> sets;
+                std::vector<uint32_t> hash(elem_size, 0);
+                res->fnv_hash(hash.data(), 0, elem_size);
+                for (auto row_id = 0; row_id < elem_size; row_id++) {
+                    is_duplicated = false;
+                    if (!sets.contains(hash[row_id])) {
+                        sets.emplace(hash[row_id]);
+                    } else {
+                        for (auto next_id = 0; next_id < row_id; next_id++) {
+                            if (hash[row_id] == hash[next_id] && res->equals(next_id, *res, row_id)) {
+                                is_duplicated = true;
+                                break;
+                            }
+                        }
+                    }
+                    duplicated_flags[row_id] = is_duplicated;
+                }
+            }
+            Buffer<uint32_t> index;
+            if (!duplicated_flags.empty() || !perm.empty()) {
+                auto res_num = 0;
+                index.resize(elem_size);
+                for (auto row_id = 0; row_id < elem_size; row_id++) {
+                    if (duplicated_flags.empty()) {
+                        index[res_num++] = perm[row_id].index_in_chunk;
+                    } else {
+                        if (perm.empty()) {
+                            if (!duplicated_flags[row_id]) {
+                                index[res_num++] = row_id;
+                            }
+                        } else {
+                            if (!duplicated_flags[perm[row_id].index_in_chunk]) {
+                                index[res_num++] = perm[row_id].index_in_chunk;
+                            }
+                        }
+                    }
+                }
+                index.resize(res_num);
+                elem_size = res_num;
+            }
+            auto* elements_col = array_col->elements_column_raw_ptr();
+            if (index.empty()) {
+                elements_col->append(*res, 0, elem_size);
+            } else {
+                elements_col->append_selective(*res, index);
+            }
             // for window function, we can not clear State::data_columns, since its data are used to produce
             // result,for an example: array_agg(c) over(partition by a order by b)
             if constexpr (!std::is_same_v<AggState, ArrayAggWindowStateV2>) {
-                state_impl.release_order_by_columns();
+                state_impl.data_columns.clear(); // early release memory
             }
-            if (UNLIKELY(ctx->state()->cancelled_ref())) {
-                ctx->set_error("array_agg detects cancelled.", false);
+            auto* offsets_col = array_col->offsets_column_raw_ptr();
+            offsets_col->append(offsets_col->immutable_data().back() + elem_size);
+            // should check overflow after append, otherwise the result column with multi row will be overflow.
+            if (UNLIKELY(state_impl.check_overflow(*to, ctx))) {
                 return;
             }
-            if (UNLIKELY(!st.ok())) {
-                ctx->set_error(st.to_string().c_str(), false);
-                return;
-            }
-        }
-        // further remove duplicated values
-        // TODO(fzh) optimize N*N, since distinct is often rewritten to group by, the distinct values are not too many.
-        Buffer<bool> duplicated_flags;
-        if (ctx->get_is_distinct()) {
-            duplicated_flags.resize(elem_size);
-            bool is_duplicated = false;
-            phmap::flat_hash_set<uint32_t> sets;
-            std::vector<uint32_t> hash(elem_size, 0);
-            res->fnv_hash(hash.data(), 0, elem_size);
-            for (auto row_id = 0; row_id < elem_size; row_id++) {
-                is_duplicated = false;
-                if (!sets.contains(hash[row_id])) {
-                    sets.emplace(hash[row_id]);
-                } else {
-                    for (auto next_id = 0; next_id < row_id; next_id++) {
-                        if (hash[row_id] == hash[next_id] && res->equals(next_id, *res, row_id)) {
-                            is_duplicated = true;
-                            break;
-                        }
-                    }
-                }
-                duplicated_flags[row_id] = is_duplicated;
-            }
-        }
-        Buffer<uint32_t> index;
-        if (!duplicated_flags.empty() || !perm.empty()) {
-            auto res_num = 0;
-            index.resize(elem_size);
-            for (auto row_id = 0; row_id < elem_size; row_id++) {
-                if (duplicated_flags.empty()) {
-                    index[res_num++] = perm[row_id].index_in_chunk;
-                } else {
-                    if (perm.empty()) {
-                        if (!duplicated_flags[row_id]) {
-                            index[res_num++] = row_id;
-                        }
-                    } else {
-                        if (!duplicated_flags[perm[row_id].index_in_chunk]) {
-                            index[res_num++] = perm[row_id].index_in_chunk;
-                        }
-                    }
-                }
-            }
-            index.resize(res_num);
-            elem_size = res_num;
-        }
-        auto* elements_col = array_col->elements_column_raw_ptr();
-        if (index.empty()) {
-            elements_col->append(*res, 0, elem_size);
-        } else {
-            elements_col->append_selective(*res, index);
-        }
-        // for window function, we can not clear State::data_columns, since its data are used to produce
-        // result,for an example: array_agg(c) over(partition by a order by b)
-        if constexpr (!std::is_same_v<AggState, ArrayAggWindowStateV2>) {
-            state_impl.data_columns.clear(); // early release memory
-        }
-        auto* offsets_col = array_col->offsets_column_raw_ptr();
-        offsets_col->append(offsets_col->immutable_data().back() + elem_size);
-        // should check overflow after append, otherwise the result column with multi row will be overflow.
-        if (UNLIKELY(state_impl.check_overflow(*to, ctx))) {
-            return;
         }
     }
 
@@ -564,7 +815,11 @@ public:
     }
 
     void reset(FunctionContext* ctx, const Columns& args, AggDataPtr __restrict state) const override {
-        this->data(state).reset(ctx);
+        if constexpr (std::is_same_v<AggState, ArrayAggAggregateStateV2Shared>) {
+            this->data(state).row_indices.clear();
+        } else {
+            this->data(state).reset(ctx);
+        }
     }
 
     void get_values(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* dst, size_t start,
