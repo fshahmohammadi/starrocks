@@ -1,0 +1,88 @@
+-- name: test_disable_open_rewrite_join
+-- Reproduce crash via RuntimeFilter path (requires JOIN)
+-- The bug: expr_disable_open_rewrite misses DictMappingExpr in lambda's _common_sub_expr
+-- Crash happens during open() when runtime filter pushes down expressions
+--
+-- Related bugs (same children() vs do_for_each_child pattern):
+-- 1. BE expr_disable_open_rewrite in parser.cpp
+-- 2. BE contains_dict_mapping_expr in runtime_filter_bank.cpp
+-- 3. FE ExprUtils.containsDictMappingExpr
+
+-- Force dict optimization and runtime filter push-down
+SET cbo_enable_low_cardinality_optimize = true;
+SET enable_global_runtime_filter = true;
+SET enable_join_runtime_filter_push_down = true;
+SET runtime_filter_scan_wait_time = 20000;
+
+CREATE TABLE t_left (
+    id INT,
+    str_col VARCHAR(100) NOT NULL,
+    arr ARRAY<VARCHAR(10)>
+) ENGINE=OLAP
+DUPLICATE KEY(id)
+DISTRIBUTED BY HASH(id) BUCKETS 1
+PROPERTIES ("replication_num" = "1");
+
+CREATE TABLE t_right (
+    id INT,
+    val INT
+) ENGINE=OLAP
+DUPLICATE KEY(id)
+DISTRIBUTED BY HASH(id) BUCKETS 1
+PROPERTIES ("replication_num" = "1");
+
+INSERT INTO t_left VALUES
+    (1, 'aaa', ['x', 'y']),
+    (2, 'bbb', ['x', 'y']),
+    (3, 'aaa', ['x', 'y']),
+    (4, 'ccc', ['x', 'y']),
+    (5, 'bbb', ['x', 'y']);
+
+INSERT INTO t_right VALUES (1, 100), (2, 200), (3, 300);
+
+[UC] ANALYZE FULL TABLE t_left;
+[UC] ANALYZE FULL TABLE t_right;
+function: wait_global_dict_ready('str_col', 't_left')
+
+-- Case 1: JOIN with lambda containing dict column in common sub-expr
+SELECT l.id, array_map(x -> concat(x, upper(l.str_col)), l.arr) as result
+FROM t_left l JOIN t_right r ON l.id = r.id
+ORDER BY l.id;
+
+-- Case 2: JOIN with hash function on dict column in lambda
+SELECT l.id, array_map(x -> murmur_hash3_32(concat(x, l.str_col)), l.arr) as result
+FROM t_left l JOIN t_right r ON l.id = r.id
+ORDER BY l.id;
+
+-- Case 3: LEFT JOIN
+SELECT l.id, array_map(x -> concat(x, '-', upper(l.str_col)), l.arr) as result
+FROM t_left l LEFT JOIN t_right r ON l.id = r.id
+ORDER BY l.id;
+
+-- Case 4: JOIN with filter on dict column
+SELECT l.id, array_map(x -> concat(x, upper(l.str_col)), l.arr) as result
+FROM t_left l JOIN t_right r ON l.id = r.id
+WHERE l.str_col IN ('aaa', 'bbb')
+ORDER BY l.id;
+
+-- Case 5: JOIN with aggregation
+SELECT l.str_col, array_agg(array_map(x -> concat(x, upper(l.str_col)), l.arr)) as result
+FROM t_left l JOIN t_right r ON l.id = r.id
+GROUP BY l.str_col
+ORDER BY l.str_col;
+
+-- Case 6: Multiple joins
+SELECT l.id, array_map(x -> concat(x, upper(l.str_col)), l.arr) as result
+FROM t_left l
+JOIN t_right r1 ON l.id = r1.id
+JOIN t_right r2 ON l.id = r2.id
+ORDER BY l.id;
+
+-- Case 7: Subquery with join
+SELECT * FROM (
+    SELECT l.id, array_map(x -> concat(x, upper(l.str_col)), l.arr) as result
+    FROM t_left l JOIN t_right r ON l.id = r.id
+) sub ORDER BY id;
+
+DROP TABLE t_left;
+DROP TABLE t_right;
