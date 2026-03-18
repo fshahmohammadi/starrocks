@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include <vector>
+
 #include "util/runtime_profile.h"
 
 namespace starrocks {
@@ -70,5 +72,9 @@ struct AggStatistics {
 
     RuntimeProfile::HighWaterMarkCounter* chunk_buffer_peak_memory{};
     RuntimeProfile::HighWaterMarkCounter* chunk_buffer_peak_size{};
+
+    // per-aggregate-function, per-column input bytes
+    // agg_input_bytes[i][j] = bytes for j-th input column of i-th agg function
+    std::vector<std::vector<RuntimeProfile::Counter*>> agg_input_bytes;
 };
 } // namespace starrocks

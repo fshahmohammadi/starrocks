@@ -429,6 +429,17 @@ Status Aggregator::prepare(RuntimeState* state, ObjectPool* pool, RuntimeProfile
     _is_only_group_by_columns = _agg_expr_ctxs.empty() && !_group_by_expr_ctxs.empty();
 
     _agg_stat = _pool->add(new AggStatistics(_runtime_profile));
+    // Initialize per-aggregate-function, per-column input byte counters
+    _agg_stat->agg_input_bytes.resize(agg_size);
+    for (size_t i = 0; i < agg_size; ++i) {
+        const TFunction& fn = aggregate_functions[i].nodes[0].fn;
+        size_t num_cols = _agg_input_columns[i].size();
+        _agg_stat->agg_input_bytes[i].resize(num_cols);
+        for (size_t j = 0; j < num_cols; ++j) {
+            std::string counter_name = fmt::format("AggInputBytes[{}]/{}/col{}", i, fn.name.function_name, j);
+            _agg_stat->agg_input_bytes[i][j] = ADD_COUNTER(_runtime_profile, counter_name, TUnit::BYTES);
+        }
+    }
     SCOPED_TIMER(_runtime_profile->total_time_counter());
 
     _intermediate_tuple_desc = state->desc_tbl().get_tuple_descriptor(_intermediate_tuple_id);
@@ -802,6 +813,14 @@ Status Aggregator::evaluate_agg_input_column(Chunk* chunk, std::vector<ExprConte
             }
         }
         _agg_input_raw_columns[i][j] = _agg_input_columns[i][j].get();
+    }
+    // Track per-aggregate-function, per-column input bytes
+    if (i >= 0 && static_cast<size_t>(i) < _agg_stat->agg_input_bytes.size()) {
+        for (size_t j = 0; j < _agg_input_columns[i].size(); j++) {
+            if (_agg_input_columns[i][j] != nullptr && j < _agg_stat->agg_input_bytes[i].size()) {
+                COUNTER_UPDATE(_agg_stat->agg_input_bytes[i][j], _agg_input_columns[i][j]->byte_size());
+            }
+        }
     }
     return Status::OK();
 }
