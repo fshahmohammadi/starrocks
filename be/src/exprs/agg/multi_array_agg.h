@@ -17,6 +17,7 @@
 #include "column/array_column.h"
 #include "column/binary_column.h"
 #include "column/column_helper.h"
+#include "column/fixed_length_column.h"
 #include "column/struct_column.h"
 #include "exec/sorting/sorting.h"
 #include "exprs/agg/aggregate.h"
@@ -28,7 +29,8 @@ namespace starrocks {
 
 // Per-group state: serialized row buffer.
 // Buffer is a flat concatenation of serialized rows.
-// Row format: [null_bitmap (ceil(N/8) bytes)][non-null field values...]
+// Row format: [null_bitmap (ceil(N/8) bytes)][field values...]
+// Dict-encoded fields use compact fixed-width encoding (1/2/3 bytes per value).
 struct MultiArrayAggAggregateState {
     std::string buffer;
 };
@@ -39,7 +41,9 @@ struct MultiArrayAggAggregateState {
 //
 // Intermediate type: VARBINARY blob per group.
 // Blob format: [row1][row2]... (flat concatenation, no header)
-// Row format: [null_bitmap (ceil(N/8) bytes)][non-null field values...]
+// Row format: [null_bitmap (ceil(N/8) bytes)][field values...]
+//   - Dict-encoded columns use fixed-width encoding (1/2/3 bytes) based on dict size.
+//   - Non-dict columns use Column::serialize().
 class MultiArrayAggAggregateFunction final
         : public AggregateFunctionBatchHelper<MultiArrayAggAggregateState, MultiArrayAggAggregateFunction> {
 public:
@@ -58,13 +62,19 @@ public:
         auto& s = this->data(state);
         size_t num_fields = ctx->get_arg_types().size();
         size_t nbm = (num_fields + 7) / 8;
+        const auto& dw = ctx->get_dict_encoded_widths();
 
         // Compute serialized row size
         uint32_t row_size = static_cast<uint32_t>(nbm);
         for (size_t i = 0; i < num_fields; ++i) {
             if (!_is_null(columns[i], row_num)) {
-                auto [dc, ar] = _unwrap(columns[i], row_num);
-                row_size += dc->serialize_size(ar);
+                int8_t w = _dict_width(dw, i);
+                if (w > 0) {
+                    row_size += w;
+                } else {
+                    auto [dc, ar] = _unwrap(columns[i], row_num);
+                    row_size += dc->serialize_size(ar);
+                }
             }
         }
 
@@ -80,8 +90,15 @@ public:
             if (_is_null(columns[i], row_num)) {
                 bitmap[i / 8] |= (1 << (i % 8));
             } else {
-                auto [dc, ar] = _unwrap(columns[i], row_num);
-                pos += dc->serialize(ar, pos);
+                int8_t w = _dict_width(dw, i);
+                if (w > 0) {
+                    auto [dc, ar] = _unwrap(columns[i], row_num);
+                    _encode_fixed(pos, _get_int32_value(dc, ar), w);
+                    pos += w;
+                } else {
+                    auto [dc, ar] = _unwrap(columns[i], row_num);
+                    pos += dc->serialize(ar, pos);
+                }
             }
         }
 
@@ -111,6 +128,9 @@ public:
     void serialize_to_column(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* to) const override {
         auto& s = this->data(const_cast<AggDataPtr>(state));
 
+        ctx->add_agg_buffer_size(static_cast<int64_t>(s.buffer.size()));
+        ctx->add_agg_buffer_capacity(static_cast<int64_t>(s.buffer.capacity()));
+
         auto* bin = ColumnHelper::get_binary_column(to);
         auto& bytes = bin->get_bytes();
         size_t old_size = bytes.size();
@@ -125,6 +145,10 @@ public:
 
     void finalize_to_column(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* to) const override {
         auto& s = this->data(const_cast<AggDataPtr>(state));
+
+        ctx->add_agg_buffer_size(static_cast<int64_t>(s.buffer.size()));
+        ctx->add_agg_buffer_capacity(static_cast<int64_t>(s.buffer.capacity()));
+
         size_t num_fields = ctx->get_arg_types().size();
         size_t nbm = (num_fields + 7) / 8;
         size_t num_order_by = ctx->get_is_asc_order().size();
@@ -197,13 +221,19 @@ public:
 
         size_t num_fields = src.size();
         size_t nbm = (num_fields + 7) / 8;
+        const auto& dw = ctx->get_dict_encoded_widths();
 
         for (size_t row = 0; row < chunk_size; ++row) {
             uint32_t row_size = static_cast<uint32_t>(nbm);
             for (size_t i = 0; i < num_fields; ++i) {
                 if (!_is_null(src[i].get(), row)) {
-                    auto [dc, ar] = _unwrap(src[i].get(), row);
-                    row_size += dc->serialize_size(ar);
+                    int8_t w = _dict_width(dw, i);
+                    if (w > 0) {
+                        row_size += w;
+                    } else {
+                        auto [dc, ar] = _unwrap(src[i].get(), row);
+                        row_size += dc->serialize_size(ar);
+                    }
                 }
             }
 
@@ -219,8 +249,15 @@ public:
                 if (_is_null(src[i].get(), row)) {
                     bitmap[i / 8] |= (1 << (i % 8));
                 } else {
-                    auto [dc, ar] = _unwrap(src[i].get(), row);
-                    dst_ptr += dc->serialize(ar, dst_ptr);
+                    int8_t w = _dict_width(dw, i);
+                    if (w > 0) {
+                        auto [dc, ar] = _unwrap(src[i].get(), row);
+                        _encode_fixed(dst_ptr, _get_int32_value(dc, ar), w);
+                        dst_ptr += w;
+                    } else {
+                        auto [dc, ar] = _unwrap(src[i].get(), row);
+                        dst_ptr += dc->serialize(ar, dst_ptr);
+                    }
                 }
             }
 
@@ -243,6 +280,32 @@ public:
     std::string get_name() const override { return "multi_array_agg"; }
 
 private:
+    // Get the dict encoding width for field i, or 0 if not dict-encoded.
+    static int8_t _dict_width(const std::vector<int8_t>& dw, size_t i) {
+        return i < dw.size() ? dw[i] : 0;
+    }
+
+    // Read an int32 value from a (unwrapped) column at the given row.
+    // Dict-encoded columns are Int32Column (LowCardDictColumn).
+    static int32_t _get_int32_value(const Column* col, size_t row) {
+        return down_cast<const FixedLengthColumn<int32_t>*>(col)->get_data()[row];
+    }
+
+    // Encode an int32 value in little-endian using exactly `width` bytes (1, 2, or 3).
+    static void _encode_fixed(uint8_t* dst, int32_t val, int8_t width) {
+        dst[0] = static_cast<uint8_t>(val);
+        if (width >= 2) dst[1] = static_cast<uint8_t>(val >> 8);
+        if (width >= 3) dst[2] = static_cast<uint8_t>(val >> 16);
+    }
+
+    // Decode a fixed-width little-endian integer (1, 2, or 3 bytes) as int32.
+    static int32_t _decode_fixed(const uint8_t* src, int8_t width) {
+        int32_t val = src[0];
+        if (width >= 2) val |= static_cast<int32_t>(src[1]) << 8;
+        if (width >= 3) val |= static_cast<int32_t>(src[2]) << 16;
+        return val;
+    }
+
     static MutableColumns _deserialize_buffer(FunctionContext* ctx, const std::string& buffer, size_t num_fields,
                                               size_t nbm) {
         MutableColumns cols;
@@ -251,6 +314,7 @@ private:
             cols.emplace_back(FunctionHelper::create_column(*ctx->get_arg_type(i), true));
         }
 
+        const auto& dw = ctx->get_dict_encoded_widths();
         const uint8_t* pos = reinterpret_cast<const uint8_t*>(buffer.data());
         const uint8_t* end = pos + buffer.size();
         while (pos < end) {
@@ -263,8 +327,16 @@ private:
                 if (is_null) {
                     nullable->append_nulls(1);
                 } else {
-                    pos = nullable->data_column()->deserialize_and_append(pos);
-                    nullable->null_column_data().emplace_back(0);
+                    int8_t w = _dict_width(dw, i);
+                    if (w > 0) {
+                        int32_t val = _decode_fixed(pos, w);
+                        pos += w;
+                        down_cast<FixedLengthColumn<int32_t>*>(nullable->data_column().get())->append(val);
+                        nullable->null_column_data().emplace_back(0);
+                    } else {
+                        pos = nullable->data_column()->deserialize_and_append(pos);
+                        nullable->null_column_data().emplace_back(0);
+                    }
                 }
             }
         }

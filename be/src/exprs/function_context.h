@@ -100,11 +100,13 @@ public:
     std::vector<bool> get_is_asc_order() { return _is_asc_order; }
     std::vector<bool> get_nulls_first() { return _nulls_first; }
     bool get_is_distinct() { return _is_distinct; }
+    const std::vector<int8_t>& get_dict_encoded_widths() const { return _dict_encoded_widths; }
     // for tests
     void set_is_asc_order(const std::vector<bool>& order) { _is_asc_order = order; }
     void set_nulls_first(const std::vector<bool>& nulls) { _nulls_first = nulls; }
     void set_runtime_state(RuntimeState* const state) { _state = state; }
     void set_is_distinct(bool is_distinct) { _is_distinct = is_distinct; }
+    void set_dict_encoded_widths(const std::vector<int8_t>& widths) { _dict_encoded_widths = widths; }
 
     // Returns _constant_columns size
     int get_num_constant_columns() const;
@@ -164,6 +166,13 @@ public:
 
     std::unique_ptr<NgramBloomFilterState>& get_ngram_state() { return _ngramState; }
 
+    // Agg buffer diagnostics: track actual data size vs allocated capacity across all groups.
+    // Used by multi_array_agg_v2 to diagnose size vs capacity discrepancies.
+    void add_agg_buffer_size(int64_t delta) { _agg_buffer_total_size += delta; }
+    void add_agg_buffer_capacity(int64_t delta) { _agg_buffer_total_capacity += delta; }
+    int64_t agg_buffer_total_size() const { return _agg_buffer_total_size; }
+    int64_t agg_buffer_total_capacity() const { return _agg_buffer_total_capacity; }
+
 private:
     friend class ExprContext;
 
@@ -206,7 +215,13 @@ private:
     std::vector<bool> _is_asc_order;
     std::vector<bool> _nulls_first;
     bool _is_distinct = false;
+    // Per-argument dict encoding byte width (0 = not dict-encoded, 1/2/3 = fixed byte width).
+    std::vector<int8_t> _dict_encoded_widths;
     ssize_t group_concat_max_len = 1024;
+
+    // Agg buffer diagnostics
+    int64_t _agg_buffer_total_size = 0;
+    int64_t _agg_buffer_total_capacity = 0;
 
     // used for ngram bloom filter to speed up some function
     std::unique_ptr<NgramBloomFilterState> _ngramState;

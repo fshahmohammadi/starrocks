@@ -42,6 +42,24 @@ Status AggregateStreamingSinkOperator::prepare_local_state(RuntimeState* state) 
 void AggregateStreamingSinkOperator::close(RuntimeState* state) {
     auto* counter = ADD_COUNTER(_unique_metrics, "HashTableMemoryUsage", TUnit::BYTES);
     COUNTER_SET(counter, _aggregator->hash_map_memory_usage());
+
+    auto* state_mem = ADD_COUNTER(_unique_metrics, "AggStateMemoryUsage", TUnit::BYTES);
+    COUNTER_SET(state_mem, _aggregator->agg_state_memory_usage());
+
+    // Per-function buffer size vs capacity diagnostics
+    const auto& fn_ctxs = _aggregator->agg_fn_ctxs();
+    for (size_t i = 0; i < fn_ctxs.size(); ++i) {
+        auto* ctx = fn_ctxs[i];
+        if (ctx->agg_buffer_total_size() > 0 || ctx->agg_buffer_total_capacity() > 0) {
+            auto* size_counter = ADD_COUNTER(_unique_metrics,
+                                             fmt::format("AggBufferSize[{}]", i), TUnit::BYTES);
+            COUNTER_SET(size_counter, ctx->agg_buffer_total_size());
+            auto* cap_counter = ADD_COUNTER(_unique_metrics,
+                                            fmt::format("AggBufferCapacity[{}]", i), TUnit::BYTES);
+            COUNTER_SET(cap_counter, ctx->agg_buffer_total_capacity());
+        }
+    }
+
     _aggregator->unref(state);
     Operator::close(state);
 }
