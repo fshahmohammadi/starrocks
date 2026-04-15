@@ -16,6 +16,7 @@ package com.starrocks.sql;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Stopwatch;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import com.starrocks.alter.SchemaChangeHandler;
@@ -104,6 +105,7 @@ import com.starrocks.sql.optimizer.base.PhysicalPropertySet;
 import com.starrocks.sql.optimizer.base.RoundRobinDistributionSpec;
 import com.starrocks.sql.optimizer.base.SortProperty;
 import com.starrocks.sql.optimizer.operator.logical.LogicalProjectOperator;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalDecodeOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CastOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
@@ -161,6 +163,9 @@ public class InsertPlanner {
 
     private List<Column> outputBaseSchema;
     private List<Column> outputFullSchema;
+
+    // Dict passthrough: column names that should skip decode and pass INT codes directly to the sink
+    private Set<String> passthroughColumnNames = new HashSet<>();
 
     private static final Logger LOG = LogManager.getLogger(InsertPlanner.class);
 
@@ -390,13 +395,20 @@ public class InsertPlanner {
             TupleDescriptor tupleDesc = descriptorTable.createTupleDescriptor();
 
             List<Pair<Integer, ColumnDict>> globalDicts = Lists.newArrayList();
+            List<Integer> dictPassthroughSlotIds = Lists.newArrayList();
             long tableId = targetTable.getId();
             for (Column column : outputFullSchema) {
                 SlotDescriptor slotDescriptor = descriptorTable.addSlotDescriptor(tupleDesc);
                 slotDescriptor.setIsMaterialized(true);
-                slotDescriptor.setType(column.getType());
                 slotDescriptor.setColumn(column);
                 slotDescriptor.setIsNullable(column.isAllowNull());
+                if (passthroughColumnNames.contains(column.getName())) {
+                    // Passthrough column: set slot type to INT (dict codes) instead of VARCHAR
+                    slotDescriptor.setType(Type.INT);
+                    dictPassthroughSlotIds.add(slotDescriptor.getId().asInt());
+                } else {
+                    slotDescriptor.setType(column.getType());
+                }
                 if (column.getType().isVarchar() &&
                         IDictManager.getInstance().hasGlobalDict(tableId, column.getColumnId())) {
                     Optional<ColumnDict> dict = IDictManager.getInstance().getGlobalDict(tableId, column.getColumnId());
@@ -553,6 +565,9 @@ public class InsertPlanner {
             }
             sinkFragment.setSink(dataSink);
             sinkFragment.setLoadGlobalDicts(globalDicts);
+            if (!dictPassthroughSlotIds.isEmpty()) {
+                sinkFragment.setDictPassthroughColumnIds(dictPassthroughSlotIds);
+            }
             return execPlan;
         }
     }
@@ -598,6 +613,7 @@ public class InsertPlanner {
     private ExecPlan buildExecPlan(InsertStmt insertStmt, ConnectContext session, List<ColumnRefOperator> outputColumns,
                                    LogicalPlan logicalPlan, ColumnRefFactory columnRefFactory,
                                    QueryRelation queryRelation, Table targetTable) {
+        passthroughColumnNames.clear();
         PreOptimizePlanContext preOptimizePlanContext = preparePreOptimizePlanContext(
                 insertStmt, session.getSessionVariable(), targetTable, outputColumns, columnRefFactory, logicalPlan);
 
@@ -617,13 +633,101 @@ public class InsertPlanner {
                     preOptimizePlanContext.requiredColumns);
         }
 
+        // Dict passthrough: skip decode for non-partition/non-distribution key dict columns
+        List<ColumnRefOperator> effectiveOutputColumns = logicalPlan.getOutputColumn();
+        if (targetTable instanceof OlapTable && optimizedPlan.getOp() instanceof PhysicalDecodeOperator) {
+            OlapTable olapTable = (OlapTable) targetTable;
+            PhysicalDecodeOperator decodeOp = (PhysicalDecodeOperator) optimizedPlan.getOp();
+            Map<ColumnRefOperator, ColumnRefOperator> dictToStrings = decodeOp.getDictToStrings();
+
+            // Collect partition, distribution, sort key, and key column names
+            Set<String> keyColumnNames = new HashSet<>();
+            for (String name : olapTable.getPartitionColumnNames()) {
+                keyColumnNames.add(name.toLowerCase());
+            }
+            keyColumnNames.addAll(olapTable.getDistributionColumnNames());
+            for (Column keyCol : olapTable.getKeyColumns()) {
+                keyColumnNames.add(keyCol.getName().toLowerCase());
+            }
+            // Exclude explicit sort key columns (DUP_KEYS ORDER BY)
+            MaterializedIndexMeta indexMeta = olapTable.getIndexMetaByIndexId(olapTable.getBaseIndexId());
+            if (indexMeta != null && indexMeta.getSortKeyIdxes() != null) {
+                List<Column> schema = indexMeta.getSchema();
+                for (int idx : indexMeta.getSortKeyIdxes()) {
+                    if (idx < schema.size()) {
+                        keyColumnNames.add(schema.get(idx).getName().toLowerCase());
+                    }
+                }
+            }
+
+            // Identify passthrough columns
+            Map<ColumnRefOperator, ColumnRefOperator> passthroughEntries = new HashMap<>();
+            for (Map.Entry<ColumnRefOperator, ColumnRefOperator> entry : dictToStrings.entrySet()) {
+                ColumnRefOperator dictRef = entry.getKey();
+                ColumnRefOperator stringRef = entry.getValue();
+
+                // Skip columns with string functions (e.g., upper(col), substr(col,...)).
+                // These columns have a derived dict with a code space different from the source dict.
+                // The INT codes flowing through the pipeline represent source dict codes, not derived codes.
+                // Passing source codes through would write original values instead of function results.
+                // Supporting this requires: (1) applying code_convert_map in DictDecodeOperator to
+                // convert source→derived codes, (2) propagating the derived dict to the sink fragment,
+                // and (3) sending the derived dict (with codes) in the TabletWriterOpen RPC.
+                if (decodeOp.getStringFunctions().containsKey(dictRef)) {
+                    continue;
+                }
+
+                // Find which target table column this maps to
+                for (int i = 0; i < effectiveOutputColumns.size() && i < outputFullSchema.size(); i++) {
+                    if (effectiveOutputColumns.get(i).getId() == stringRef.getId()) {
+                        String colName = outputFullSchema.get(i).getName().toLowerCase();
+                        if (!keyColumnNames.contains(colName)) {
+                            passthroughEntries.put(dictRef, stringRef);
+                            passthroughColumnNames.add(outputFullSchema.get(i).getName());
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if (!passthroughEntries.isEmpty()) {
+                // Create modified output columns: swap stringRef for dictRef
+                effectiveOutputColumns = new ArrayList<>(effectiveOutputColumns);
+                for (Map.Entry<ColumnRefOperator, ColumnRefOperator> entry : passthroughEntries.entrySet()) {
+                    ColumnRefOperator dictRef = entry.getKey();
+                    ColumnRefOperator stringRef = entry.getValue();
+                    for (int i = 0; i < effectiveOutputColumns.size(); i++) {
+                        if (effectiveOutputColumns.get(i).getId() == stringRef.getId()) {
+                            effectiveOutputColumns.set(i, dictRef);
+                            break;
+                        }
+                    }
+                }
+
+                // Modify optimized plan: remove passthrough columns from decode
+                Map<ColumnRefOperator, ColumnRefOperator> remainingDict = new HashMap<>(dictToStrings);
+                passthroughEntries.keySet().forEach(remainingDict::remove);
+
+                if (remainingDict.isEmpty() && decodeOp.getStringFunctions().isEmpty()) {
+                    // No columns need decoding, remove the decode node entirely
+                    optimizedPlan = optimizedPlan.inputAt(0);
+                } else {
+                    // Create a new PhysicalDecodeOperator with fewer columns
+                    PhysicalDecodeOperator newDecodeOp = new PhysicalDecodeOperator(
+                            ImmutableMap.copyOf(remainingDict),
+                            decodeOp.getStringFunctions());
+                    optimizedPlan = OptExpression.create(newDecodeOp, optimizedPlan.getInputs());
+                }
+            }
+        }
+
         //8. Build fragment exec plan
         boolean hasOutputFragment = ((queryRelation instanceof SelectRelation && queryRelation.hasLimit())
                 || targetTable instanceof MysqlTable);
         ExecPlan execPlan;
         try (Timer ignore3 = Tracers.watchScope("PlanBuilder")) {
             execPlan = PlanFragmentBuilder.createPhysicalPlan(
-                    optimizedPlan, session, logicalPlan.getOutputColumn(), columnRefFactory,
+                    optimizedPlan, session, effectiveOutputColumns, columnRefFactory,
                     queryRelation.getColumnOutputNames(), TResultSinkType.MYSQL_PROTOCAL, hasOutputFragment);
         }
         return execPlan;

@@ -232,18 +232,23 @@ void NodeChannel::_open(int64_t index_id, RefCountClosure<PTabletWriterOpenResul
     DCHECK(fragment_dict_state != nullptr);
     const auto& global_dict = fragment_dict_state->load_global_dicts();
     const auto& dict_version = fragment_dict_state->load_dict_versions();
+    const auto& passthrough_ids = fragment_dict_state->dict_passthrough_column_ids();
     for (size_t i = 0; i < request.schema().slot_descs_size(); i++) {
         auto slot = request.mutable_schema()->mutable_slot_descs(i);
         auto it = global_dict.find(slot->id());
         if (it != global_dict.end()) {
-            auto dict = it->second.first;
-            for (auto& item : dict) {
+            const auto& dict = it->second.first;
+            for (const auto& item : dict) {
                 slot->add_global_dict_words(item.first.to_string());
+                slot->add_global_dict_codes(item.second);
             }
         }
         auto it_version = dict_version.find(slot->id());
         if (it_version != dict_version.end()) {
             slot->set_global_dict_version(it_version->second);
+        }
+        if (passthrough_ids.count(slot->id()) > 0) {
+            slot->set_is_dict_passthrough(true);
         }
     }
 

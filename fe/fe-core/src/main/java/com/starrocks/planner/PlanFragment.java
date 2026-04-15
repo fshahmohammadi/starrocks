@@ -168,6 +168,8 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     protected List<Pair<Integer, ColumnDict>> queryGlobalDicts = Lists.newArrayList();
     protected Map<Integer, Expr> queryGlobalDictExprs;
     protected List<Pair<Integer, ColumnDict>> loadGlobalDicts = Lists.newArrayList();
+    // Slot IDs of columns that remain dict-encoded (INT codes) in the sink input
+    protected List<Integer> dictPassthroughColumnIds = Lists.newArrayList();
 
     private final Set<Integer> runtimeFilterBuildNodeIds = Sets.newHashSet();
 
@@ -508,6 +510,9 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         }
         if (!loadGlobalDicts.isEmpty()) {
             result.setLoad_global_dicts(dictToThrift(loadGlobalDicts));
+        }
+        if (!dictPassthroughColumnIds.isEmpty()) {
+            result.setDict_passthrough_column_ids(dictPassthroughColumnIds);
         }
         if (cacheParam != null) {
             if (ConnectContext.get() != null) {
@@ -867,6 +872,14 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     public void setLoadGlobalDicts(
             List<Pair<Integer, ColumnDict>> loadGlobalDicts) {
         this.loadGlobalDicts = loadGlobalDicts;
+    }
+
+    public List<Integer> getDictPassthroughColumnIds() {
+        return dictPassthroughColumnIds;
+    }
+
+    public void setDictPassthroughColumnIds(List<Integer> dictPassthroughColumnIds) {
+        this.dictPassthroughColumnIds = dictPassthroughColumnIds;
     }
 
     public boolean hashLocalBucketShuffleRightOrFullJoin(PlanNode planRoot) {

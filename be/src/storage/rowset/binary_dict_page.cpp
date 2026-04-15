@@ -114,6 +114,64 @@ uint32_t BinaryDictPageBuilder::add(const uint8_t* vals, uint32_t count) {
     }
 }
 
+uint32_t BinaryDictPageBuilder::add_codes(const int32_t* codes, uint32_t count,
+                                           const RGlobalDictMap& source_dict) {
+    if (_encoding_type == PLAIN_ENCODING) {
+        // Dict page full — resolve codes to strings and write as plain.
+        // Null-position codes may be garbage; use empty Slice as placeholder.
+        std::vector<Slice> slices(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            auto it = source_dict.find(codes[i]);
+            slices[i] = (it != source_dict.end()) ? it->second : Slice();
+        }
+        return _data_page_builder->add(reinterpret_cast<const uint8_t*>(slices.data()), count);
+    }
+
+    DCHECK(!_finished);
+    DCHECK_GT(count, 0);
+    auto* code_page = down_cast<BitshufflePageBuilder<TYPE_INT>*>(_data_page_builder.get());
+
+    if (_data_page_builder->count() == 0) {
+        auto it = source_dict.find(codes[0]);
+        if (it != source_dict.end()) {
+            _first_value.assign_copy(reinterpret_cast<const uint8_t*>(it->second.data), it->second.size);
+        }
+        // else: first entry is a null position — _first_value stays empty
+    }
+
+    for (uint32_t i = 0; i < count; ++i) {
+        int32_t source_code = codes[i];
+        uint32_t local_code;
+
+        auto it = _code_mapping.find(source_code);
+        if (it != _code_mapping.end()) {
+            local_code = it->second;
+        } else {
+            // First time seeing this source code — resolve string, add to local dict.
+            // Null positions in format 2 may contain uninitialized codes that are not
+            // in the source dict. Write a placeholder code (0) for such entries;
+            // the null map will suppress them on read.
+            auto str_it = source_dict.find(source_code);
+            if (UNLIKELY(str_it == source_dict.end())) {
+                local_code = 0;
+            } else {
+                Slice s = str_it->second;
+                if (!_dict_builder->add_slice(s)) {
+                    return i; // dict page full
+                }
+                local_code = _dictionary.size();
+                _dictionary.insert_or_assign(std::string(s.data, s.size), local_code);
+                _code_mapping[source_code] = local_code;
+            }
+        }
+
+        if (code_page->add_one(reinterpret_cast<const uint8_t*>(&local_code)) < 1) {
+            return i;
+        }
+    }
+    return count;
+}
+
 faststring* BinaryDictPageBuilder::finish() {
     DCHECK(!_finished);
     _finished = true;

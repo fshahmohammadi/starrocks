@@ -15,6 +15,7 @@
 #pragma once
 
 #include <map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/status.h"
@@ -38,6 +39,11 @@ public:
     const GlobalDictMaps& load_global_dicts() const { return _load_global_dicts; }
     const phmap::flat_hash_map<uint32_t, int64_t>& load_dict_versions() const { return _load_dict_versions; }
 
+    const std::unordered_set<int32_t>& dict_passthrough_column_ids() const { return _dict_passthrough_column_ids; }
+    void set_dict_passthrough_column_ids(std::unordered_set<int32_t> ids) {
+        _dict_passthrough_column_ids = std::move(ids);
+    }
+
     DictOptimizeParser* mutable_dict_optimize_parser() { return &_dict_optimize_parser; }
 
     Status init_query_global_dict(RuntimeState* runtime_state, const GlobalDictLists& global_dict_list);
@@ -53,6 +59,7 @@ private:
     GlobalDictMaps _query_global_dicts;
     GlobalDictMaps _load_global_dicts;
     phmap::flat_hash_map<uint32_t, int64_t> _load_dict_versions;
+    std::unordered_set<int32_t> _dict_passthrough_column_ids;
     DictOptimizeParser _dict_optimize_parser;
 };
 

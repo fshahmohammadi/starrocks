@@ -252,6 +252,7 @@ private:
             _delta_writers_impl.delta_writers();
 
     GlobalDictByNameMaps _global_dicts;
+    std::unordered_set<std::string> _dict_passthrough_columns;
     std::unique_ptr<MemPool> _mem_pool;
 
     bool _is_replicated_storage = false;

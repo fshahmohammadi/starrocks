@@ -16,11 +16,14 @@
 
 #include <atomic>
 #include <ostream>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "column/vectorized_fwd.h"
 #include "exec/sorting/sort_permute.h"
 #include "gen_cpp/data.pb.h"
 #include "gen_cpp/olap_file.pb.h"
+#include "runtime/global_dict/types.h"
 #include "storage/chunk_aggregator.h"
 #include "storage/olap_define.h"
 #include "storage/primary_key_encoding_types.h"
@@ -118,6 +121,12 @@ public:
 
     const MemtableStats& get_stat() const { return _stats; }
 
+    // Set dict passthrough info for decoding INT codes before full_row_column encoding.
+    // column_name -> RGlobalDictMap (code -> Slice)
+    void set_dict_passthrough_reverse_dicts(
+            const std::unordered_set<std::string>& passthrough_columns,
+            const GlobalDictByNameMaps* global_dicts);
+
 private:
     Status _merge();
 
@@ -173,6 +182,10 @@ private:
 
     MemtableStats _stats;
     PrimaryKeyEncodingType _pk_encoding_type = PrimaryKeyEncodingType::PK_ENCODING_TYPE_NONE;
+
+    // Dict passthrough: column index in schema -> reverse dict for decoding INT codes to strings.
+    // Used to decode passthrough columns before full_row_column encoding in PRIMARY_KEYS tables.
+    std::unordered_map<int, RGlobalDictMap> _passthrough_reverse_dicts;
 };
 
 inline std::ostream& operator<<(std::ostream& os, const MemTable& table) {

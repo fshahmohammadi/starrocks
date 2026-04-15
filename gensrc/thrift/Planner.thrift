@@ -111,6 +111,9 @@ struct TPlanFragment {
   22: optional TCacheParam cache_param
   23: optional map<i32, Exprs.TExpr> query_global_dict_exprs
   24: optional TGroupExecutionParam group_execution_param
+  // Column IDs that remain dict-encoded (INT codes) in the sink input,
+  // skipping the Decode node. The source dict is in load_global_dicts.
+  25: optional list<i32> dict_passthrough_column_ids
 }
 
 // location information for a single scan range

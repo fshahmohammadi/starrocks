@@ -41,6 +41,7 @@
 #include "base/phmap/phmap.h"
 #include "gen_cpp/segment.pb.h"
 #include "gutil/hash/string_hash.h"
+#include "runtime/global_dict/types_fwd_decl.h"
 #include "runtime/mem_pool.h"
 #include "storage/olap_common.h"
 #include "storage/range.h"
@@ -68,6 +69,10 @@ public:
     bool is_page_full() override;
 
     uint32_t add(const uint8_t* vals, uint32_t count) override;
+
+    // Add dict-encoded INT codes directly, using source_dict to resolve codes to strings.
+    // Only used when dict-passthrough optimization is active.
+    uint32_t add_codes(const int32_t* codes, uint32_t count, const RGlobalDictMap& source_dict);
 
     faststring* finish() override;
 
@@ -117,6 +122,8 @@ private:
     EncodingTypePB _encoding_type{DICT_ENCODING};
     // query for dict item -> dict id
     phmap::flat_hash_map<std::string, uint32_t, HashOfSlice, Eq> _dictionary;
+    // source dict code -> local file dict code (for dict-passthrough optimization)
+    phmap::flat_hash_map<int32_t, uint32_t> _code_mapping;
     faststring _first_value;
 };
 

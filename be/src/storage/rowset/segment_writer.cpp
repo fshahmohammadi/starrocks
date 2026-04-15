@@ -41,6 +41,7 @@
 #include "base/string/faststring.h"
 #include "column/binary_column.h"
 #include "column/chunk.h"
+#include "column/fixed_length_column.h"
 #include "column/datum_tuple.h"
 #include "column/nullable_column.h"
 #include "column/schema.h"
@@ -214,6 +215,16 @@ Status SegmentWriter::init(const std::vector<uint32_t>& column_indexes, bool has
             if (iter != _opts.global_dicts->end()) {
                 opts.global_dict = &iter->second.dict;
                 _global_dict_columns_valid_info[iter->first] = true;
+
+                // Dict-passthrough: build reverse dict and set on column writer options
+                if (_opts.dict_passthrough_columns != nullptr &&
+                    _opts.dict_passthrough_columns->count(column.name()) > 0) {
+                    auto& reverse_dict = _passthrough_reverse_dicts[column.name()];
+                    for (auto& [slice, code] : iter->second.dict) {
+                        reverse_dict[code] = slice;
+                    }
+                    opts.source_dict_for_passthrough = &reverse_dict;
+                }
             }
         }
         if (column.type() == LogicalType::TYPE_JSON && _opts.global_dicts != nullptr) {
@@ -426,8 +437,52 @@ Status SegmentWriter::append_chunk(const Chunk& chunk) {
         // just missing full row column, generate it and write to file
         auto full_row_col = BinaryColumn::create();
         auto row_encoder = RowStoreEncoderFactory::instance()->get_or_create_encoder(SIMPLE);
-        RETURN_IF_ERROR(row_encoder->encode_chunk_to_full_row_column(*_schema_without_full_row_column, chunk,
-                                                                     full_row_col.get()));
+        if (_passthrough_reverse_dicts.empty()) {
+            RETURN_IF_ERROR(row_encoder->encode_chunk_to_full_row_column(*_schema_without_full_row_column, chunk,
+                                                                         full_row_col.get()));
+        } else {
+            // Dict passthrough: decode INT code columns to strings before full_row encoding.
+            size_t num_key_fields = _schema_without_full_row_column->num_key_fields();
+            Columns value_columns;
+            for (size_t i = num_key_fields; i < chunk_num_columns; i++) {
+                const auto& col_name = _tablet_schema->column(i).name();
+                auto pt_it = _passthrough_reverse_dicts.find(col_name);
+                if (pt_it == _passthrough_reverse_dicts.end()) {
+                    value_columns.emplace_back(chunk.get_column_by_index(i));
+                    continue;
+                }
+                auto& rdict = pt_it->second;
+                const auto* src_col = chunk.get_column_raw_ptr_by_index(i);
+                bool is_nullable = src_col->is_nullable();
+                const Int32Column* codes_col;
+                const NullColumn* null_col = nullptr;
+                if (is_nullable) {
+                    auto* nullable = down_cast<const NullableColumn*>(src_col);
+                    codes_col = down_cast<const Int32Column*>(nullable->data_column().get());
+                    null_col = nullable->null_column().get();
+                } else {
+                    codes_col = down_cast<const Int32Column*>(src_col);
+                }
+                auto decoded = BinaryColumn::create();
+                decoded->reserve(codes_col->size());
+                for (size_t r = 0; r < codes_col->size(); r++) {
+                    if (null_col && null_col->get_data()[r]) {
+                        decoded->append_default();
+                    } else {
+                        auto it = rdict.find(codes_col->get_data()[r]);
+                        DCHECK(it != rdict.end());
+                        decoded->append(it->second);
+                    }
+                }
+                if (is_nullable) {
+                    value_columns.emplace_back(NullableColumn::create(decoded, null_col->clone()));
+                } else {
+                    value_columns.emplace_back(decoded);
+                }
+            }
+            RETURN_IF_ERROR(row_encoder->encode_columns_to_full_row_column(*_schema_without_full_row_column,
+                                                                           value_columns, *full_row_col.get()));
+        }
         RETURN_IF_ERROR(_column_writers[chunk_num_columns]->append(*full_row_col));
     } else {
         DCHECK_EQ(_column_writers.size(), chunk_num_columns);

@@ -18,7 +18,9 @@
 
 #include "base/time/time.h"
 #include "column/binary_column.h"
+#include "column/fixed_length_column.h"
 #include "column/json_column.h"
+#include "column/nullable_column.h"
 #include "column/raw_data_visitor.h"
 #include "common/config_ingest_fwd.h"
 #include "common/config_primary_key_fwd.h"
@@ -136,6 +138,29 @@ MemTable::MemTable(int64_t tablet_id, const Schema* schema, MemTableSink* sink, 
 
 MemTable::~MemTable() = default;
 
+void MemTable::set_dict_passthrough_reverse_dicts(
+        const std::unordered_set<std::string>& passthrough_columns,
+        const GlobalDictByNameMaps* global_dicts) {
+    if (passthrough_columns.empty() || global_dicts == nullptr) {
+        return;
+    }
+    // Build reverse dicts indexed by column position in schema
+    for (int i = 0; i < _vectorized_schema->num_fields(); i++) {
+        const auto& field_name = _vectorized_schema->field(i)->name();
+        if (passthrough_columns.count(field_name) == 0) {
+            continue;
+        }
+        auto dict_it = global_dicts->find(field_name);
+        if (dict_it == global_dicts->end()) {
+            continue;
+        }
+        auto& reverse_dict = _passthrough_reverse_dicts[i];
+        for (auto& [slice, code] : dict_it->second.dict) {
+            reverse_dict[code] = slice;
+        }
+    }
+}
+
 size_t MemTable::memory_usage() const {
     size_t size = 0;
 
@@ -196,8 +221,55 @@ StatusOr<bool> MemTable::insert(const Chunk& chunk, const uint32_t* indexes, uin
             is_column_with_row = true;
             // add row column
             auto row_encoder = RowStoreEncoderFactory::instance()->get_or_create_encoder(SIMPLE);
-            (void)row_encoder->encode_chunk_to_full_row_column(*schema_without_full_row_column, chunk,
-                                                               full_row_col.get());
+            if (_passthrough_reverse_dicts.empty()) {
+                (void)row_encoder->encode_chunk_to_full_row_column(*schema_without_full_row_column, chunk,
+                                                                   full_row_col.get());
+            } else {
+                // Dict passthrough: some value columns contain INT codes that must be decoded
+                // to strings before encoding into the full row column.
+                // Build a Columns vector with passthrough columns decoded.
+                // encode_columns_to_full_row_column takes value columns only (key columns excluded).
+                size_t num_key_fields = schema_without_full_row_column->num_key_fields();
+                Columns value_columns;
+                for (size_t i = num_key_fields; i < chunk.num_columns(); i++) {
+                    auto pt_it = _passthrough_reverse_dicts.find(static_cast<int>(i));
+                    if (pt_it == _passthrough_reverse_dicts.end()) {
+                        value_columns.emplace_back(chunk.get_column_by_index(i));
+                        continue;
+                    }
+                    // Decode INT codes → BinaryColumn
+                    auto& rdict = pt_it->second;
+                    auto& src_col = chunk.get_column_by_index(i);
+                    bool is_nullable = src_col->is_nullable();
+                    const Int32Column* codes_col;
+                    const NullColumn* null_col = nullptr;
+                    if (is_nullable) {
+                        auto* nullable = down_cast<const NullableColumn*>(src_col.get());
+                        codes_col = down_cast<const Int32Column*>(nullable->data_column().get());
+                        null_col = nullable->null_column().get();
+                    } else {
+                        codes_col = down_cast<const Int32Column*>(src_col.get());
+                    }
+                    auto decoded = BinaryColumn::create();
+                    decoded->reserve(codes_col->size());
+                    for (size_t r = 0; r < codes_col->size(); r++) {
+                        if (null_col && null_col->get_data()[r]) {
+                            decoded->append_default();
+                        } else {
+                            auto it = rdict.find(codes_col->get_data()[r]);
+                            DCHECK(it != rdict.end());
+                            decoded->append(it->second);
+                        }
+                    }
+                    if (is_nullable) {
+                        value_columns.emplace_back(NullableColumn::create(decoded, null_col->clone()));
+                    } else {
+                        value_columns.emplace_back(decoded);
+                    }
+                }
+                (void)row_encoder->encode_columns_to_full_row_column(*schema_without_full_row_column,
+                                                                     value_columns, *full_row_col.get());
+            }
         } else {
             // when doing schema change, the chunk has shadow columns,
             // so the columns in the chunk will be more than the fields in the schema.

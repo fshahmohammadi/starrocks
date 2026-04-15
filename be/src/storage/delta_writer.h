@@ -55,6 +55,8 @@ struct DeltaWriterOptions {
     // slots are in order of tablet's schema
     const std::vector<SlotDescriptor*>* slots;
     GlobalDictByNameMaps* global_dicts = nullptr;
+    // Column names that remain dict-encoded (INT codes) in the input data.
+    std::unordered_set<std::string> dict_passthrough_columns;
     Span parent_span;
     int64_t index_id;
     int64_t node_id;

@@ -109,6 +109,7 @@ DeltaWriterOptions LocalTabletsChannel::_build_delta_writer_options(const PTable
     options.load_id = params.id();
     options.slots = index_slots;
     options.global_dicts = &_global_dicts;
+    options.dict_passthrough_columns = _dict_passthrough_columns;
     options.parent_span = _load_channel->get_span();
     options.index_id = _index_id;
     options.node_id = _node_id;
@@ -755,18 +756,24 @@ Status LocalTabletsChannel::_open_all_writers(const PTabletWriterOpenRequest& pa
     for (auto& slot : params.schema().slot_descs()) {
         GlobalDictMap global_dict;
         if (slot.global_dict_words_size()) {
+            const bool has_codes = slot.global_dict_codes_size() == slot.global_dict_words_size();
             for (size_t i = 0; i < slot.global_dict_words_size(); i++) {
                 const std::string& dict_word = slot.global_dict_words(i);
                 auto* data = _mem_pool->allocate(dict_word.size());
                 RETURN_IF_UNLIKELY_NULL(data, Status::MemoryAllocFailed("alloc mem for global dict failed"));
                 memcpy(data, dict_word.data(), dict_word.size());
                 Slice slice(data, dict_word.size());
-                global_dict.emplace(slice, i);
+                int32_t code = has_codes ? slot.global_dict_codes(i) : static_cast<int32_t>(i);
+                global_dict.emplace(slice, code);
             }
             GlobalDictsWithVersion<GlobalDictMap> dict;
             dict.dict = std::move(global_dict);
             dict.version = slot.has_global_dict_version() ? slot.global_dict_version() : 0;
             _global_dicts.emplace(std::string(slot.col_name()), std::move(dict));
+
+            if (slot.has_is_dict_passthrough() && slot.is_dict_passthrough()) {
+                _dict_passthrough_columns.insert(std::string(slot.col_name()));
+            }
         }
     }
 

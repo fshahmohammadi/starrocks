@@ -83,6 +83,7 @@ public:
     uint32_t max_rows_per_segment = INT32_MAX;
 
     GlobalDictByNameMaps* global_dicts = nullptr;
+    std::unordered_set<std::string> dict_passthrough_columns;
 
     RowsetWriterType writer_type = kHorizontal;
 

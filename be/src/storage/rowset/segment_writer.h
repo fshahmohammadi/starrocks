@@ -79,6 +79,7 @@ struct SegmentWriterOptions {
     uint32_t num_rows_per_block = 1024;
 #endif
     GlobalDictByNameMaps* global_dicts = nullptr;
+    const std::unordered_set<std::string>* dict_passthrough_columns = nullptr;
     std::vector<int32_t> referenced_column_ids;
     SegmentFileMark segment_file_mark;
     std::string encryption_meta;
@@ -195,6 +196,10 @@ private:
     uint32_t _num_rows = 0;
 
     DictColumnsValidMap _global_dict_columns_valid_info;
+
+    // Reverse dicts for dict-passthrough columns (built from GlobalDictMap).
+    // Stored here to ensure lifetime matches column writers.
+    std::unordered_map<std::string, RGlobalDictMap> _passthrough_reverse_dicts;
 };
 
 } // namespace starrocks

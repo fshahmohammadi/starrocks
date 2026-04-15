@@ -854,6 +854,12 @@ Status FragmentExecutor::_prepare_global_dict(const UnifiedExecPlanFragmentParam
     if (fragment.__isset.load_global_dicts) {
         RETURN_IF_ERROR(fragment_dict_state->init_load_global_dict(runtime_state, fragment.load_global_dicts));
     }
+
+    if (fragment.__isset.dict_passthrough_column_ids) {
+        std::unordered_set<int32_t> ids(fragment.dict_passthrough_column_ids.begin(),
+                                         fragment.dict_passthrough_column_ids.end());
+        fragment_dict_state->set_dict_passthrough_column_ids(std::move(ids));
+    }
     return Status::OK();
 }
 
