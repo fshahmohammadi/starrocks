@@ -38,6 +38,15 @@ public:
     const GlobalDictMaps& load_global_dicts() const { return _load_global_dicts; }
     const phmap::flat_hash_map<uint32_t, int64_t>& load_dict_versions() const { return _load_dict_versions; }
 
+    // Maps sink slot ID -> dictRef slot ID for dict-passthrough columns.
+    // The dictRef slot ID is the key into query_global_dicts() for the source dict.
+    const phmap::flat_hash_map<int32_t, int32_t>& dict_passthrough_source_slot_map() const {
+        return _dict_passthrough_source_slot_map;
+    }
+    void set_dict_passthrough_source_slot_map(phmap::flat_hash_map<int32_t, int32_t> map) {
+        _dict_passthrough_source_slot_map = std::move(map);
+    }
+
     DictOptimizeParser* mutable_dict_optimize_parser() { return &_dict_optimize_parser; }
 
     Status init_query_global_dict(RuntimeState* runtime_state, const GlobalDictLists& global_dict_list);
@@ -53,6 +62,7 @@ private:
     GlobalDictMaps _query_global_dicts;
     GlobalDictMaps _load_global_dicts;
     phmap::flat_hash_map<uint32_t, int64_t> _load_dict_versions;
+    phmap::flat_hash_map<int32_t, int32_t> _dict_passthrough_source_slot_map;
     DictOptimizeParser _dict_optimize_parser;
 };
 

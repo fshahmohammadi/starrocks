@@ -854,6 +854,12 @@ Status FragmentExecutor::_prepare_global_dict(const UnifiedExecPlanFragmentParam
     if (fragment.__isset.load_global_dicts) {
         RETURN_IF_ERROR(fragment_dict_state->init_load_global_dict(runtime_state, fragment.load_global_dicts));
     }
+
+    if (fragment.__isset.dict_passthrough_source_slot_map) {
+        fragment_dict_state->set_dict_passthrough_source_slot_map(
+                {fragment.dict_passthrough_source_slot_map.begin(),
+                 fragment.dict_passthrough_source_slot_map.end()});
+    }
     return Status::OK();
 }
 

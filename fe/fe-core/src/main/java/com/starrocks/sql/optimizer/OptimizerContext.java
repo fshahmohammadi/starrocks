@@ -26,6 +26,7 @@ import com.starrocks.sql.common.ErrorType;
 import com.starrocks.sql.common.StarRocksPlannerException;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
 import com.starrocks.sql.optimizer.dump.DumpInfo;
+import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.IsNullPredicateOperator;
 import com.starrocks.sql.optimizer.rule.RuleSet;
 import com.starrocks.sql.optimizer.rule.RuleType;
@@ -36,6 +37,7 @@ import com.starrocks.sql.optimizer.transformer.MVTransformerContext;
 import org.apache.spark.util.SizeEstimator;
 import oshi.util.FormatUtil;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -89,6 +91,14 @@ public class OptimizerContext {
 
     // source tables count in the query
     private int sourceTablesCount = 0;
+
+    // Dict passthrough for INSERT INTO...SELECT: non-key output column refs that are safe
+    // to keep dict-encoded because they go directly to an OlapTableSink.
+    // Set by InsertPlanner before optimization; read by DecodeRewriter.
+    private List<ColumnRefOperator> sinkPassthroughOutputColumns = List.of();
+    // Result: maps stringRef ID -> dictRef ID for columns that were actually kept as dict-encoded.
+    // Set by LowCardinalityRewriteRule after DecodeRewriter; read by InsertPlanner.
+    private Map<Integer, Integer> sinkDictPassthroughResult = Map.of();
 
     OptimizerContext(ConnectContext context) {
         this.connectContext = context;
@@ -303,6 +313,22 @@ public class OptimizerContext {
 
     public Stopwatch getOptimizerTimer() {
         return optimizerTimer;
+    }
+
+    public List<ColumnRefOperator> getSinkPassthroughOutputColumns() {
+        return sinkPassthroughOutputColumns;
+    }
+
+    public void setSinkPassthroughOutputColumns(List<ColumnRefOperator> columns) {
+        this.sinkPassthroughOutputColumns = columns;
+    }
+
+    public Map<Integer, Integer> getSinkDictPassthroughResult() {
+        return sinkDictPassthroughResult;
+    }
+
+    public void setSinkDictPassthroughResult(Map<Integer, Integer> result) {
+        this.sinkDictPassthroughResult = result;
     }
 
     /**

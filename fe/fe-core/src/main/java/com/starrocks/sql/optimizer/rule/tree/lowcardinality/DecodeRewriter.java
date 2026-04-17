@@ -63,6 +63,7 @@ import com.starrocks.type.Type;
 import org.apache.commons.collections4.CollectionUtils;
 import org.jetbrains.annotations.NotNull;
 
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -102,9 +103,10 @@ public class DecodeRewriter extends OptExpressionVisitor<OptExpression, ColumnRe
         return result;
     }
 
-    public OptExpression rewrite(OptExpression optExpression) {
+    public Pair<OptExpression, Map<Integer, Integer>> rewrite(OptExpression optExpression,
+                                                               List<ColumnRefOperator> sinkPassthroughOutputColumns) {
         if (context.allStringColumns.isEmpty()) {
-            return optExpression;
+            return Pair.create(optExpression, Map.of());
         }
         context.initRewriteExpressions();
         // check output need decode
@@ -115,11 +117,33 @@ public class DecodeRewriter extends OptExpressionVisitor<OptExpression, ColumnRe
         // compute the fragment used dict expr
         optExpression = rewriteImpl(optExpression, new ColumnRefSet());
         if (!decodeInfo.outputStringColumns.isEmpty()) {
-            // decode the output dict column
-            return insertStructuredDecodeNode(optExpression, decodeInfo.outputStringColumns, decodeInfo.outputStringColumns);
+            ColumnRefSet columnsToDecode = decodeInfo.outputStringColumns;
+            // Dict passthrough: exclude columns that go directly to an OlapTableSink
+            Map<Integer, Integer> passthroughResult = new HashMap<>();
+            if (sessionVariable.isEnableDictPassthroughSink()
+                    && !sinkPassthroughOutputColumns.isEmpty()) {
+                columnsToDecode = columnsToDecode.clone();
+                for (ColumnRefOperator outputRef : sinkPassthroughOutputColumns) {
+                    int stringId = outputRef.getId();
+                    if (columnsToDecode.contains(stringId)) {
+                        ColumnRefOperator stringRef = factory.getColumnRef(stringId);
+                        ColumnRefOperator dictRef = context.stringRefToDictRefMap.get(stringRef);
+                        if (dictRef != null) {
+                            columnsToDecode.except(new ColumnRefSet(stringId));
+                            passthroughResult.put(stringId, dictRef.getId());
+                        }
+                    }
+                }
+            }
+
+            if (!columnsToDecode.isEmpty()) {
+                return Pair.create(insertStructuredDecodeNode(optExpression,
+                        decodeInfo.outputStringColumns, columnsToDecode), passthroughResult);
+            }
+            return Pair.create(optExpression, passthroughResult);
         }
 
-        return optExpression;
+        return Pair.create(optExpression, Map.of());
     }
 
     // fragmentUseDictExprs: record the dict columns used in this fragment, to

@@ -168,6 +168,10 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     protected List<Pair<Integer, ColumnDict>> queryGlobalDicts = Lists.newArrayList();
     protected Map<Integer, Expr> queryGlobalDictExprs;
     protected List<Pair<Integer, ColumnDict>> loadGlobalDicts = Lists.newArrayList();
+    // Maps sink slot ID -> dictRef slot ID for dict-passthrough columns.
+    // Columns in this map remain dict-encoded (INT codes) in the sink input.
+    // The dictRef slot ID is the key into queryGlobalDicts for the source dict.
+    protected Map<Integer, Integer> dictPassthroughSourceSlotMap = Maps.newHashMap();
 
     private final Set<Integer> runtimeFilterBuildNodeIds = Sets.newHashSet();
 
@@ -508,6 +512,9 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         }
         if (!loadGlobalDicts.isEmpty()) {
             result.setLoad_global_dicts(dictToThrift(loadGlobalDicts));
+        }
+        if (!dictPassthroughSourceSlotMap.isEmpty()) {
+            result.setDict_passthrough_source_slot_map(dictPassthroughSourceSlotMap);
         }
         if (cacheParam != null) {
             if (ConnectContext.get() != null) {
@@ -867,6 +874,14 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     public void setLoadGlobalDicts(
             List<Pair<Integer, ColumnDict>> loadGlobalDicts) {
         this.loadGlobalDicts = loadGlobalDicts;
+    }
+
+    public Map<Integer, Integer> getDictPassthroughSourceSlotMap() {
+        return dictPassthroughSourceSlotMap;
+    }
+
+    public void setDictPassthroughSourceSlotMap(Map<Integer, Integer> map) {
+        this.dictPassthroughSourceSlotMap = map;
     }
 
     public boolean hashLocalBucketShuffleRightOrFullJoin(PlanNode planRoot) {

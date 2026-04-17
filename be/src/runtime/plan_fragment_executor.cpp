@@ -130,6 +130,12 @@ Status PlanFragmentExecutor::prepare(const TExecPlanFragmentParams& request) {
         RETURN_IF_ERROR(fragment_dict_state->init_load_global_dict(_runtime_state, request.fragment.load_global_dicts));
     }
 
+    if (request.fragment.__isset.dict_passthrough_source_slot_map) {
+        fragment_dict_state->set_dict_passthrough_source_slot_map(
+                {request.fragment.dict_passthrough_source_slot_map.begin(),
+                 request.fragment.dict_passthrough_source_slot_map.end()});
+    }
+
     if (params.__isset.runtime_filter_params && params.runtime_filter_params.id_to_prober_params.size() != 0) {
         _is_runtime_filter_merge_node = true;
         runtime_services(_query_execution_services)

@@ -55,6 +55,7 @@
 #include "base/bit/rle_encoding.h"
 #include "base/string/faststring.h"
 #include "storage/rowset/array_column_writer.h"
+#include "storage/rowset/binary_dict_page.h"
 #include "storage/rowset/bitmap_index_writer.h"
 #include "storage/rowset/bitshuffle_page.h"
 #include "storage/rowset/bloom_filter_index_writer.h"
@@ -387,7 +388,12 @@ Status ScalarColumnWriter::init() {
     RETURN_IF_ERROR(
             get_block_compression_codec(_opts.meta->compression(), &_compress_codec, _opts.meta->compression_level()));
 
-    if (!_opts.need_speculate_encoding) {
+    if (_opts.source_dict_for_passthrough != nullptr) {
+        // Dict-passthrough: force DICT_ENCODING — input is INT codes, not strings.
+        // Skip speculation since we know dict encoding is correct.
+        auto st = set_encoding(DICT_ENCODING);
+        CHECK(st.ok()) << st;
+    } else if (!_opts.need_speculate_encoding) {
         auto st = set_encoding(_opts.meta->encoding());
         CHECK(st.ok()) << st;
     }
@@ -707,6 +713,15 @@ Status ScalarColumnWriter::append(const Column& column) {
     // Currently, ColumnWriter does not support null-only columns
     const uint8_t* null = ColumnHelper::get_null_data_ptr(&column);
     const Column* data_column = ColumnHelper::get_data_column(&column);
+
+    // Dict-passthrough: input is INT codes, route to add_codes() path
+    if (_opts.source_dict_for_passthrough != nullptr) {
+        RawDataVisitor visitor;
+        RETURN_IF_ERROR(data_column->accept(&visitor));
+        const auto* codes = reinterpret_cast<const int32_t*>(visitor.result());
+        return _append_impl<true>(reinterpret_cast<const uint8_t*>(codes), null, column.size(), column.has_null());
+    }
+
     const uint8_t* ptr;
     // TODO: Remove slice cache from column writer
     if (data_column->is_binary() || data_column->is_large_binary()) {
@@ -718,7 +733,7 @@ Status ScalarColumnWriter::append(const Column& column) {
         RETURN_IF_ERROR(data_column->accept(&visitor));
         ptr = visitor.result();
     }
-    return _append(ptr, null, column.size(), column.has_null());
+    return _append_impl<false>(ptr, null, column.size(), column.has_null());
 }
 
 Status ScalarColumnWriter::append(const Column& column, const Buffer<Slice>& data) {
@@ -726,7 +741,7 @@ Status ScalarColumnWriter::append(const Column& column, const Buffer<Slice>& dat
     // Currently, ColumnWriter does not support null-only columns
     const auto* null = ColumnHelper::get_null_data_ptr(&column);
     const auto* ptr = reinterpret_cast<const uint8_t*>(data.data());
-    return _append(ptr, null, column.size(), column.has_null());
+    return _append_impl<false>(ptr, null, column.size(), column.has_null());
 }
 
 Status ScalarColumnWriter::append_array_offsets(const Column& column) {
@@ -769,26 +784,42 @@ Status ScalarColumnWriter::append_array_offsets(const Column& column) {
     return Status::OK();
 }
 
-Status ScalarColumnWriter::_append(const uint8_t* data, const uint8_t* null_flags, size_t count, bool has_null) {
-    const size_t field_size = type_info()->size();
+template <bool IsPassthrough>
+Status ScalarColumnWriter::_append_impl(const uint8_t* data, const uint8_t* null_flags, size_t count, bool has_null) {
+    const size_t field_size = IsPassthrough ? sizeof(int32_t) : type_info()->size();
+    [[maybe_unused]] BinaryDictPageBuilder* dict_pb = nullptr;
+    [[maybe_unused]] const std::vector<Slice>* source_dict = nullptr;
+    if constexpr (IsPassthrough) {
+        dict_pb = down_cast<BinaryDictPageBuilder*>(_page_builder.get());
+        source_dict = _opts.source_dict_for_passthrough;
+    }
+
     size_t remaining = count;
     while (remaining > 0) {
+        const uint8_t* batch_start = data;
+        size_t num_written = 0;
         bool page_full = false;
         bool has_null_in_page = false;
-        size_t num_written = 0;
+
+        auto add_to_page = [&](const uint8_t* ptr, size_t n) -> size_t {
+            if constexpr (IsPassthrough) {
+                return dict_pb->add_codes(reinterpret_cast<const int32_t*>(ptr), n, *source_dict);
+            } else {
+                return _page_builder->add(ptr, n);
+            }
+        };
+
         if (_curr_page_format == 2) {
-            num_written = _page_builder->add(data, remaining);
+            num_written = add_to_page(data, remaining);
             page_full = num_written < remaining;
             if (_null_map_builder_v2 != nullptr) {
                 _null_map_builder_v2->add_null_flags(null_flags, num_written);
-                // The input data may be split into multiple pages, so |has_null| is true does
-                // not mean the current page has null, |null_flags| must be checked.
                 has_null_in_page = has_null && (nullptr != memchr(null_flags, 1, num_written));
                 has_null_in_page |= _null_map_builder_v2->has_null();
                 _null_map_builder_v2->set_has_null(has_null_in_page);
             }
         } else if (!has_null) {
-            num_written = _page_builder->add(data, remaining);
+            num_written = add_to_page(data, remaining);
             page_full = num_written < remaining;
             if (_null_map_builder_v1 != nullptr) {
                 _null_map_builder_v1->add_run(false, num_written);
@@ -800,7 +831,7 @@ Status ScalarColumnWriter::_append(const uint8_t* data, const uint8_t* null_flag
                 auto [run, is_null] = pair;
                 size_t num_add = run;
                 if (!is_null) {
-                    num_add = _page_builder->add(ptr, run);
+                    num_add = add_to_page(ptr, run);
                     _null_map_builder_v1->add_run(false, run);
                 } else {
                     _null_map_builder_v1->add_run(true, run);
@@ -812,9 +843,32 @@ Status ScalarColumnWriter::_append(const uint8_t* data, const uint8_t* null_flag
             }
         }
 
+        // Resolve index data: for passthrough, decode codes→Slices; otherwise use raw data directly.
+        auto index_add_values = [&](const uint8_t* raw_data, size_t offset, size_t n) {
+            const uint8_t* idx_data;
+            if constexpr (IsPassthrough) {
+                _slice_buf.resize(n);
+                auto* codes = reinterpret_cast<const int32_t*>(batch_start) + offset;
+                for (size_t j = 0; j < n; j++) {
+                    DCHECK(codes[j] >= 0 && codes[j] < source_dict->size());
+                    _slice_buf[j] = (*source_dict)[codes[j]];
+                }
+                idx_data = reinterpret_cast<const uint8_t*>(_slice_buf.data());
+            } else {
+                idx_data = raw_data;
+            }
+            INDEX_ADD_VALUES(_zone_map_index_builder, idx_data, n);
+            INDEX_ADD_VALUES(_bitmap_index_builder, idx_data, n);
+            INDEX_ADD_VALUES(_bloom_filter_index_builder, idx_data, n);
+#ifndef __APPLE__
+            INDEX_ADD_VALUES(_inverted_index_builder, idx_data, n);
+#endif
+        };
+
         if (_has_index_builder & has_null_in_page) {
             const uint8_t* pdata = data;
             ByteIterator iter(null_flags, num_written);
+            size_t offset = 0;
             for (auto pair = iter.next(); pair.first > 0; pair = iter.next()) {
                 auto [run, is_null] = pair;
                 if (is_null) {
@@ -825,22 +879,15 @@ Status ScalarColumnWriter::_append(const uint8_t* data, const uint8_t* null_flag
                     INDEX_ADD_NULLS(_inverted_index_builder, run);
 #endif
                 } else {
-                    INDEX_ADD_VALUES(_zone_map_index_builder, pdata, run);
-                    INDEX_ADD_VALUES(_bitmap_index_builder, pdata, run);
-                    INDEX_ADD_VALUES(_bloom_filter_index_builder, pdata, run);
-#ifndef __APPLE__
-                    INDEX_ADD_VALUES(_inverted_index_builder, pdata, run);
-#endif
+                    index_add_values(pdata, offset, run);
                 }
-                pdata += type_info()->size() * run;
+                offset += run;
+                if constexpr (!IsPassthrough) {
+                    pdata += type_info()->size() * run;
+                }
             }
-        } else {
-            INDEX_ADD_VALUES(_zone_map_index_builder, data, num_written);
-            INDEX_ADD_VALUES(_bitmap_index_builder, data, num_written);
-            INDEX_ADD_VALUES(_bloom_filter_index_builder, data, num_written);
-#ifndef __APPLE__
-            INDEX_ADD_VALUES(_inverted_index_builder, data, num_written);
-#endif
+        } else if (_has_index_builder) {
+            index_add_values(data, 0, num_written);
         }
 
         _next_rowid += num_written;
@@ -854,6 +901,9 @@ Status ScalarColumnWriter::_append(const uint8_t* data, const uint8_t* null_flag
     return Status::OK();
 }
 
+template Status ScalarColumnWriter::_append_impl<false>(const uint8_t*, const uint8_t*, size_t, bool);
+template Status ScalarColumnWriter::_append_impl<true>(const uint8_t*, const uint8_t*, size_t, bool);
+
 ////////////////////////////////////////////////////////////////////////////////
 
 StringColumnWriter::StringColumnWriter(const ColumnWriterOptions& opts, TypeInfoPtr type_info,
@@ -862,6 +912,11 @@ StringColumnWriter::StringColumnWriter(const ColumnWriterOptions& opts, TypeInfo
           _scalar_column_writer(std::move(column_writer)) {}
 
 Status StringColumnWriter::append(const Column& column) {
+    // Dict-passthrough: input is INT codes, bypass all string-specific processing
+    // (check_string_lengths, speculate encoding, buffering) and delegate directly.
+    if (_scalar_column_writer->opts().source_dict_for_passthrough != nullptr) {
+        return _scalar_column_writer->append(column);
+    }
     if (config::enable_check_string_lengths) {
         RETURN_IF_ERROR(check_string_lengths(column));
     }

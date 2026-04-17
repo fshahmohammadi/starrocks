@@ -351,6 +351,7 @@ Status DeltaWriter::_init() {
     writer_context.load_id = _opt.load_id;
     writer_context.segments_overlap = OVERLAPPING;
     writer_context.global_dicts = _opt.global_dicts;
+    writer_context.passthrough_source_dicts = _opt.passthrough_source_dicts;
     writer_context.miss_auto_increment_column = _opt.miss_auto_increment_column;
     writer_context.flat_json_config = _tablet->flat_json_config();
 
@@ -709,6 +710,9 @@ Status DeltaWriter::_reset_mem_table() {
         pk_encoding_type = PrimaryKeyEncodingType::PK_ENCODING_TYPE_V1;
     }
     RETURN_IF_ERROR(_mem_table->prepare(pk_encoding_type));
+    if (_opt.passthrough_source_dicts != nullptr) {
+        _mem_table->set_dict_passthrough_reverse_dicts(_opt.passthrough_source_dicts);
+    }
     _mem_table->set_write_buffer_row(_memtable_buffer_row);
     _write_buffer_size = _mem_table->write_buffer_size();
     return Status::OK();

@@ -111,6 +111,11 @@ struct TPlanFragment {
   22: optional TCacheParam cache_param
   23: optional map<i32, Exprs.TExpr> query_global_dict_exprs
   24: optional TGroupExecutionParam group_execution_param
+  // Maps sink slot ID -> dictRef slot ID for dict-passthrough columns.
+  // Columns in this map remain dict-encoded (INT codes) in the sink input,
+  // skipping the Decode node. The dictRef slot ID is the key into
+  // query_global_dicts for the source dict with correct code space.
+  25: optional map<i32, i32> dict_passthrough_source_slot_map
 }
 
 // location information for a single scan range

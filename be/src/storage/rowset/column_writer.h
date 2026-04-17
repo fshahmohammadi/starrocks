@@ -37,6 +37,7 @@
 #include <storage/flat_json_config.h>
 
 #include <memory> // for unique_ptr
+#include <vector>
 
 #include "column/vectorized_fwd.h"
 #include "common/status.h"      // for Status
@@ -93,6 +94,10 @@ struct ColumnWriterOptions {
     // when column data is encoding by dict
     // if global_dict is not nullptr, will checkout whether global_dict can cover all data
     const GlobalDictMap* global_dict = nullptr;
+    // Source dict for dict-passthrough optimization: 1-based vector where source_dict[code] = Slice.
+    // When non-null, input column contains INT dict codes instead of strings.
+    // BinaryDictPageBuilder uses this to resolve codes→strings only once per distinct value.
+    const std::vector<Slice>* source_dict_for_passthrough = nullptr;
     // map<sub_column_name, dict> for FlatJSON
     std::unordered_map<std::string, const GlobalDictMap> flat_json_dicts;
 
@@ -241,6 +246,8 @@ public:
 
     uint64_t total_mem_footprint() const override { return _total_mem_footprint; }
 
+    const ColumnWriterOptions& opts() const { return _opts; }
+
 private:
     // All Pages will be organized into a linked list
     struct Page {
@@ -275,7 +282,8 @@ private:
         _data_size += 20;
     }
 
-    Status _append(const uint8_t* data, const uint8_t* null_flags, size_t count, bool has_null);
+    template <bool IsPassthrough>
+    Status _append_impl(const uint8_t* data, const uint8_t* null_flags, size_t count, bool has_null);
 
     Status _write_data_page(Page* page);
 
