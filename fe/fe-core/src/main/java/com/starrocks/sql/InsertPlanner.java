@@ -405,8 +405,11 @@ public class InsertPlanner {
                 slotDescriptor.setIsNullable(column.isAllowNull());
                 Integer dictRefSlotId = passthroughColumnToDictRefSlotId.get(column.getName());
                 if (dictRefSlotId != null) {
-                    // Passthrough column: set slot type to INT (dict codes) instead of VARCHAR
+                    // Passthrough column: set slot type to INT (dict codes) instead of VARCHAR.
+                    // Must set originType too because SlotDescriptor.toThrift() uses originType
+                    // when it's non-null (which setColumn() always sets).
                     slotDescriptor.setType(Type.INT);
+                    slotDescriptor.setOriginType(Type.INT);
                     passthroughSourceSlotMap.put(slotDescriptor.getId().asInt(), dictRefSlotId);
                 } else {
                     slotDescriptor.setType(column.getType());
