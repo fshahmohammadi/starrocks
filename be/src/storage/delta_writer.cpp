@@ -695,7 +695,7 @@ Status DeltaWriter::_build_current_tablet_schema(int64_t index_id, const POlapTa
 
 Status DeltaWriter::_reset_mem_table() {
     if (!_schema_initialized) {
-        _vectorized_schema = MemTable::convert_schema(_tablet_schema, _opt.slots);
+        _vectorized_schema = MemTable::convert_schema(_tablet_schema, _opt.slots, _opt.passthrough_source_dicts);
         _schema_initialized = true;
     }
     if (_tablet_schema->keys_type() == KeysType::PRIMARY_KEYS && !_opt.merge_condition.empty()) {

@@ -39,6 +39,7 @@
 #include "storage/row_store_encoder.h"
 #include "storage/row_store_encoder_factory.h"
 #include "storage/tablet_schema.h"
+#include "storage/types.h"
 #include "types/logical_type_infra.h"
 
 namespace starrocks {
@@ -48,8 +49,10 @@ static const string LOAD_OP_COLUMN = "__op";
 
 #define ADD_COUNTER_RELAXED(counter, value) counter.fetch_add(value, std::memory_order_relaxed)
 
-Schema MemTable::convert_schema(const TabletSchemaCSPtr& tablet_schema,
-                                const std::vector<SlotDescriptor*>* slot_descs) {
+Schema MemTable::convert_schema(
+        const TabletSchemaCSPtr& tablet_schema, const std::vector<SlotDescriptor*>* slot_descs,
+        const phmap::flat_hash_map<std::string, std::vector<Slice>>* passthrough_source_dicts) {
+    Schema schema;
     if (tablet_schema->keys_type() == KeysType::PRIMARY_KEYS) {
         const auto& last_column = tablet_schema->columns().back();
         // remove last __row column if exists, because it's not used in memtable
@@ -62,7 +65,7 @@ Schema MemTable::convert_schema(const TabletSchemaCSPtr& tablet_schema,
         for (ColumnId i = 0; i < ncolumn; i++) {
             column_idxes.push_back(i);
         }
-        Schema schema = Schema(tablet_schema->schema(), column_idxes, tablet_schema->schema()->sort_key_idxes());
+        schema = Schema(tablet_schema->schema(), column_idxes, tablet_schema->schema()->sort_key_idxes());
         if (slot_descs != nullptr && slot_descs->back()->col_name() == LOAD_OP_COLUMN) {
             // load slots have __op field, so add to _vectorized_schema
             auto op_column =
@@ -70,10 +73,25 @@ Schema MemTable::convert_schema(const TabletSchemaCSPtr& tablet_schema,
             op_column->set_aggregate_method(STORAGE_AGGREGATE_REPLACE);
             schema.append(op_column);
         }
-        return schema;
     } else {
-        return ChunkHelper::convert_schema(tablet_schema);
+        schema = ChunkHelper::convert_schema(tablet_schema);
     }
+
+    // Dict passthrough: change passthrough VARCHAR fields to TYPE_INT so that
+    // _chunk and ChunkAggregator use Int32Column, keeping INT dict codes through
+    // to the ColumnWriter without decoding.
+    if (passthrough_source_dicts != nullptr && !passthrough_source_dicts->empty()) {
+        auto int_type = get_type_info(TYPE_INT);
+        for (size_t i = 0; i < schema.num_fields(); i++) {
+            const auto& field_name = schema.field(i)->name();
+            if (passthrough_source_dicts->count(field_name)) {
+                auto new_field = schema.field(i)->with_type(int_type);
+                schema.set_field_by_name(new_field, field_name);
+            }
+        }
+    }
+
+    return schema;
 }
 
 Status MemTable::prepare(PrimaryKeyEncodingType pk_encoding_type) {
