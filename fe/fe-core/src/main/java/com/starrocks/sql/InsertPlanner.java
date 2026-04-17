@@ -699,6 +699,23 @@ public class InsertPlanner {
         if (!(targetTable instanceof OlapTable olapTable)) {
             return List.of();
         }
+        Set<String> keyColumnNames = getKeyColumnNames(olapTable);
+
+        List<ColumnRefOperator> result = new ArrayList<>();
+        for (int i = 0; i < outputColumns.size() && i < outputFullSchema.size(); i++) {
+            String colName = outputFullSchema.get(i).getName().toLowerCase();
+            if (!keyColumnNames.contains(colName)) {
+                result.add(outputColumns.get(i));
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Returns the set of key/partition/distribution/sort column names (lowercased)
+     * for an OlapTable. Used to identify columns that must NOT be passthrough candidates.
+     */
+    static Set<String> getKeyColumnNames(OlapTable olapTable) {
         Set<String> keyColumnNames = new HashSet<>();
         keyColumnNames.addAll(olapTable.getPartitionColumnNames().stream()
                 .map(String::toLowerCase).collect(Collectors.toList()));
@@ -713,15 +730,7 @@ public class InsertPlanner {
                     .map(idx -> schema.get(idx).getName().toLowerCase())
                     .collect(Collectors.toList()));
         }
-
-        List<ColumnRefOperator> result = new ArrayList<>();
-        for (int i = 0; i < outputColumns.size() && i < outputFullSchema.size(); i++) {
-            String colName = outputFullSchema.get(i).getName().toLowerCase();
-            if (!keyColumnNames.contains(colName)) {
-                result.add(outputColumns.get(i));
-            }
-        }
-        return result;
+        return keyColumnNames;
     }
 
     private PreOptimizePlanContext preparePreOptimizePlanContext(InsertStmt insertStmt,
