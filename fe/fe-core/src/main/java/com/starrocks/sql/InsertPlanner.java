@@ -576,18 +576,17 @@ public class InsertPlanner {
             }
             if (!passthroughSourceSlotMap.isEmpty()) {
                 sinkFragment.setDictPassthroughSourceSlotMap(passthroughSourceSlotMap);
-                // Merge queryGlobalDicts and queryGlobalDictExprs for passthrough columns
-                // from the last fragment onto the sink fragment.
+                // Merge queryGlobalDicts and queryGlobalDictExprs from the source fragment
+                // onto the sink fragment. The optimizer already determined which dicts and
+                // dict exprs belong on each fragment (via DecodeRewriter.computeDictExpr),
+                // so we merge all of them rather than filtering by passthrough columns.
+                // This ensures both base dicts and derived dict exprs (plus their input
+                // dicts) are available for passthrough columns on the sink fragment.
                 PlanFragment lastFragment = execPlan.getFragments().get(
                         execPlan.getFragments().size() - 1);
-                sinkFragment.mergeQueryGlobalDicts(lastFragment.getQueryGlobalDicts().stream()
-                        .filter(k -> passthroughSourceSlotMap.containsValue(k.first))
-                        .collect(Collectors.toList()));
+                sinkFragment.mergeQueryGlobalDicts(lastFragment.getQueryGlobalDicts());
                 if (lastFragment.getQueryGlobalDictExprs() != null) {
-                    sinkFragment.mergeQueryDictExprs(lastFragment.getQueryGlobalDictExprs()
-                            .entrySet().stream()
-                            .filter(k -> passthroughSourceSlotMap.containsValue(k.getKey()))
-                            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue)));
+                    sinkFragment.mergeQueryDictExprs(lastFragment.getQueryGlobalDictExprs());
                 }
             }
             return execPlan;
