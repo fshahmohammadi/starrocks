@@ -51,8 +51,15 @@ message PSlotDescriptor {
     required string col_name = 8;
     required int32 slot_idx = 9;
     required bool is_materialized = 10;
-    repeated string global_dict_words = 11; 
+    repeated string global_dict_words = 11;
     optional int64 global_dict_version = 12;
+    // When true, this column's data contains INT dict codes (not strings).
+    // The column writer should use add_codes() with the source dict.
+    // global_dict_words carries the target table's dict (for validation).
+    // passthrough_source_dict_words carries the source dict (for code mapping),
+    // sorted lexicographically; codes are assigned as index + 1.
+    optional bool is_dict_passthrough = 15;
+    repeated string passthrough_source_dict_words = 16;
 };
 
 message PTupleDescriptor {

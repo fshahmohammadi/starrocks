@@ -35,6 +35,7 @@
 #pragma once
 
 #include <memory> // for unique_ptr
+#include <vector>
 
 #include "column/vectorized_fwd.h"
 #include "common/status.h"      // for Status
@@ -84,6 +85,10 @@ struct ColumnWriterOptions {
     // when column data is encoding by dict
     // if global_dict is not nullptr, will checkout whether global_dict can cover all data
     GlobalDictMap* global_dict = nullptr;
+
+    // Dict-passthrough: 1-based source dict vector (index 0 unused, source_dict[code] = Slice).
+    // When set, the column receives INT codes that map to strings via this dict.
+    const std::vector<Slice>* source_dict_for_passthrough = nullptr;
 
     bool need_flat = false;
     bool is_compaction = false;
@@ -197,6 +202,8 @@ public:
 
     uint64_t total_mem_footprint() const override { return _total_mem_footprint; }
 
+    const ColumnWriterOptions& opts() const { return _opts; }
+
 private:
     // All Pages will be organized into a linked list
     struct Page {
@@ -232,6 +239,9 @@ private:
     }
 
     Status append(const uint8_t* data, const uint8_t* null_flags, size_t count, bool has_null);
+
+    template <bool IsPassthrough>
+    Status _append_impl(const uint8_t* data, const uint8_t* null_flags, size_t count, bool has_null);
 
     Status _write_data_page(Page* page);
 
@@ -273,6 +283,12 @@ private:
     bool _is_global_dict_valid = true;
 
     uint64_t _total_mem_footprint = 0;
+
+    // Temporary buffer for dict-passthrough: holds decoded Slices during _append_impl<true>.
+    Buffer<Slice> _slice_buf;
+    // Temporary buffer for dict-passthrough: holds sanitized codes (null positions zeroed out)
+    // for page format 2 where all data including nulls is sent to add_codes.
+    std::vector<int32_t> _passthrough_sanitized_codes;
 };
 
 } // namespace starrocks

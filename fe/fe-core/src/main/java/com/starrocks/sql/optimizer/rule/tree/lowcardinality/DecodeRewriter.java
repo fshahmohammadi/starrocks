@@ -25,6 +25,7 @@ import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.TableFunction;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.Pair;
+import com.starrocks.qe.SessionVariable;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptExpressionVisitor;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
@@ -57,27 +58,36 @@ import com.starrocks.sql.optimizer.statistics.ColumnDict;
 import org.apache.commons.collections4.CollectionUtils;
 import org.jetbrains.annotations.NotNull;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
 /*
  * Rewrite the whole plan using the dict column by from bottom-up
  */
 public class DecodeRewriter extends OptExpressionVisitor<OptExpression, ColumnRefSet> {
+    private static final Logger LOG = LogManager.getLogger(DecodeRewriter.class);
     private final ColumnRefFactory factory;
 
     private final DecodeContext context;
 
-    public DecodeRewriter(ColumnRefFactory factory, DecodeContext context) {
+    private final SessionVariable sessionVariable;
+
+    public DecodeRewriter(ColumnRefFactory factory, DecodeContext context, SessionVariable sessionVariable) {
         this.factory = factory;
         this.context = context;
+        this.sessionVariable = sessionVariable;
     }
 
-    public OptExpression rewrite(OptExpression optExpression) {
+    public Pair<OptExpression, Map<Integer, Integer>> rewrite(OptExpression optExpression,
+                                                               List<ColumnRefOperator> sinkPassthroughOutputColumns) {
         if (context.allStringColumns.isEmpty()) {
-            return optExpression;
+            return Pair.create(optExpression, Map.of());
         }
         context.initRewriteExpressions();
         // check output need decode
@@ -88,11 +98,35 @@ public class DecodeRewriter extends OptExpressionVisitor<OptExpression, ColumnRe
         // compute the fragment used dict expr
         optExpression = rewriteImpl(optExpression, new ColumnRefSet());
         if (!decodeInfo.outputStringColumns.isEmpty()) {
-            // decode the output dict column
-            return insertDecodeNode(optExpression, decodeInfo.outputStringColumns, decodeInfo.outputStringColumns);
+            ColumnRefSet columnsToDecode = decodeInfo.outputStringColumns;
+            // Dict passthrough: exclude columns that go directly to an OlapTableSink
+            Map<Integer, Integer> passthroughResult = new HashMap<>();
+            if (sessionVariable.isEnableDictPassthroughSink()
+                    && !sinkPassthroughOutputColumns.isEmpty()) {
+                columnsToDecode = columnsToDecode.clone();
+
+                for (ColumnRefOperator outputRef : sinkPassthroughOutputColumns) {
+                    int stringId = outputRef.getId();
+                    if (columnsToDecode.contains(stringId)) {
+                        ColumnRefOperator stringRef = factory.getColumnRef(stringId);
+                        ColumnRefOperator dictRef = context.stringRefToDictRefMap.get(stringRef);
+                        if (dictRef != null) {
+                            columnsToDecode.except(new ColumnRefSet(stringId));
+                            passthroughResult.put(stringId, dictRef.getId());
+                        }
+                    }
+                }
+            }
+
+            if (!columnsToDecode.isEmpty()) {
+                // decode the output dict column
+                return Pair.create(insertDecodeNode(optExpression,
+                        decodeInfo.outputStringColumns, columnsToDecode), passthroughResult);
+            }
+            return Pair.create(optExpression, passthroughResult);
         }
 
-        return optExpression;
+        return Pair.create(optExpression, Map.of());
     }
 
     // fragmentUseDictExprs: record the dict columns used in this fragment, to

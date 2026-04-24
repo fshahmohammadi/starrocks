@@ -479,6 +479,13 @@ public:
 
     const phmap::flat_hash_map<uint32_t, int64_t>& load_dict_versions() { return _load_dict_versions; }
 
+    const phmap::flat_hash_map<int32_t, int32_t>& dict_passthrough_source_slot_map() const {
+        return _dict_passthrough_source_slot_map;
+    }
+    void set_dict_passthrough_source_slot_map(phmap::flat_hash_map<int32_t, int32_t> map) {
+        _dict_passthrough_source_slot_map = std::move(map);
+    }
+
     using GlobalDictLists = std::vector<TGlobalDict>;
     Status init_query_global_dict(const GlobalDictLists& global_dict_list);
     Status init_load_global_dict(const GlobalDictLists& global_dict_list);
@@ -699,6 +706,7 @@ private:
     GlobalDictMaps _query_global_dicts;
     GlobalDictMaps _load_global_dicts;
     phmap::flat_hash_map<uint32_t, int64_t> _load_dict_versions;
+    phmap::flat_hash_map<int32_t, int32_t> _dict_passthrough_source_slot_map;
     DictOptimizeParser _dict_optimize_parser;
 
     pipeline::QueryContext* _query_ctx = nullptr;

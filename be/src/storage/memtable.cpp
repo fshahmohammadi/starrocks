@@ -17,7 +17,9 @@
 #include <memory>
 
 #include "column/binary_column.h"
+#include "column/fixed_length_column.h"
 #include "column/json_column.h"
+#include "column/nullable_column.h"
 #include "common/logging.h"
 #include "exec/sorting/sorting.h"
 #include "gutil/strings/substitute.h"
@@ -30,6 +32,7 @@
 #include "storage/row_store_encoder.h"
 #include "storage/row_store_encoder_factory.h"
 #include "storage/tablet_schema.h"
+#include "storage/types.h"
 #include "types/logical_type_infra.h"
 #include "util/starrocks_metrics.h"
 #include "util/time.h"
@@ -41,8 +44,10 @@ static const string LOAD_OP_COLUMN = "__op";
 
 #define ADD_COUNTER_RELAXED(counter, value) counter.fetch_add(value, std::memory_order_relaxed)
 
-Schema MemTable::convert_schema(const TabletSchemaCSPtr& tablet_schema,
-                                const std::vector<SlotDescriptor*>* slot_descs) {
+Schema MemTable::convert_schema(
+        const TabletSchemaCSPtr& tablet_schema, const std::vector<SlotDescriptor*>* slot_descs,
+        const phmap::flat_hash_map<std::string, std::vector<Slice>>* passthrough_source_dicts) {
+    Schema schema;
     if (tablet_schema->keys_type() == KeysType::PRIMARY_KEYS) {
         const auto& last_column = tablet_schema->columns().back();
         // remove last __row column if exists, because it's not used in memtable
@@ -54,7 +59,7 @@ Schema MemTable::convert_schema(const TabletSchemaCSPtr& tablet_schema,
         for (ColumnId i = 0; i < ncolumn; i++) {
             column_idxes.push_back(i);
         }
-        Schema schema = Schema(tablet_schema->schema(), column_idxes, tablet_schema->schema()->sort_key_idxes());
+        schema = Schema(tablet_schema->schema(), column_idxes, tablet_schema->schema()->sort_key_idxes());
         if (slot_descs != nullptr && slot_descs->back()->col_name() == LOAD_OP_COLUMN) {
             // load slots have __op field, so add to _vectorized_schema
             auto op_column =
@@ -62,10 +67,39 @@ Schema MemTable::convert_schema(const TabletSchemaCSPtr& tablet_schema,
             op_column->set_aggregate_method(STORAGE_AGGREGATE_REPLACE);
             schema.append(op_column);
         }
-        return schema;
     } else {
-        return ChunkHelper::convert_schema(tablet_schema);
+        schema = ChunkHelper::convert_schema(tablet_schema);
     }
+
+    // Dict passthrough: change passthrough string fields to INT dict-code fields so that
+    // _chunk and ChunkAggregator use Int32Column, keeping INT dict codes through
+    // to the ColumnWriter without decoding.
+    // For scalar VARCHAR -> TYPE_INT; for ARRAY<VARCHAR> -> ARRAY<INT> (change sub-field type).
+    if (passthrough_source_dicts != nullptr && !passthrough_source_dicts->empty() && slot_descs != nullptr) {
+        auto int_type = get_type_info(TYPE_INT);
+        for (int i = 0; i < static_cast<int>(slot_descs->size()); i++) {
+            const auto& slot = (*slot_descs)[i];
+            if (passthrough_source_dicts->count(slot->col_name())) {
+                auto original_type = schema.field(i)->type()->type();
+                if (original_type == TYPE_ARRAY) {
+                    // ARRAY<VARCHAR> -> ARRAY<INT>: copy the field and change the sub-field type
+                    auto new_field = schema.field(i)->copy();
+                    if (new_field->has_sub_fields() && !new_field->sub_fields().empty()) {
+                        new_field->sub_fields()[0] = Field(new_field->sub_fields()[0].id(),
+                                                           new_field->sub_fields()[0].name(),
+                                                           int_type, new_field->sub_fields()[0].is_nullable());
+                    }
+                    schema.set_field_by_name(new_field, slot->col_name());
+                } else {
+                    // Scalar VARCHAR -> TYPE_INT
+                    auto new_field = schema.field(i)->with_type(int_type);
+                    schema.set_field_by_name(new_field, slot->col_name());
+                }
+            }
+        }
+    }
+
+    return schema;
 }
 
 void MemTable::_init_aggregator_if_needed() {
@@ -185,8 +219,49 @@ StatusOr<bool> MemTable::insert(const Chunk& chunk, const uint32_t* indexes, uin
             is_column_with_row = true;
             // add row column
             auto row_encoder = RowStoreEncoderFactory::instance()->get_or_create_encoder(SIMPLE);
-            (void)row_encoder->encode_chunk_to_full_row_column(*schema_without_full_row_column, chunk,
-                                                               full_row_col.get());
+            if (_passthrough_reverse_dicts.empty()) {
+                (void)row_encoder->encode_chunk_to_full_row_column(*schema_without_full_row_column, chunk,
+                                                                   full_row_col.get());
+            } else {
+                // Dict passthrough: some value columns contain INT codes that must be decoded
+                // to strings before encoding into the full row column.
+                size_t num_key_fields = schema_without_full_row_column->num_key_fields();
+                Columns value_columns;
+                for (size_t i = num_key_fields; i < chunk.num_columns(); i++) {
+                    auto pt_it = _passthrough_reverse_dicts.find(static_cast<int>(i));
+                    if (pt_it == _passthrough_reverse_dicts.end()) {
+                        value_columns.emplace_back(chunk.get_column_by_index(i));
+                        continue;
+                    }
+                    // Decode INT codes → BinaryColumn using 1-based source dict vector
+                    auto& source_dict = pt_it->second;
+                    auto& src_col = chunk.get_column_by_index(i);
+                    bool is_nullable = src_col->is_nullable();
+                    const Int32Column* codes_col;
+                    const NullColumn* null_col = nullptr;
+                    if (is_nullable) {
+                        auto* nullable = down_cast<const NullableColumn*>(src_col.get());
+                        codes_col = down_cast<const Int32Column*>(nullable->data_column().get());
+                        null_col = nullable->null_column().get();
+                    } else {
+                        codes_col = down_cast<const Int32Column*>(src_col.get());
+                    }
+                    auto decoded = BinaryColumn::create();
+                    decoded->reserve(codes_col->size());
+                    for (size_t r = 0; r < codes_col->size(); r++) {
+                        int32_t code = codes_col->get_data()[r];
+                        DCHECK(code >= 0 && code < source_dict.size());
+                        decoded->append(source_dict[code]);
+                    }
+                    if (is_nullable) {
+                        value_columns.emplace_back(NullableColumn::create(decoded, null_col->clone()));
+                    } else {
+                        value_columns.emplace_back(decoded);
+                    }
+                }
+                (void)row_encoder->encode_columns_to_full_row_column(*schema_without_full_row_column,
+                                                                     value_columns, *full_row_col.get());
+            }
         } else {
             // when doing schema change, the chunk has shadow columns,
             // so the columns in the chunk will be more than the fields in the schema.
@@ -547,6 +622,20 @@ Status MemTable::_sort_column_inc(bool by_sort_key) {
 
     Status st = stable_sort_and_tie_columns(false, columns, sort_descs, &_permutations);
     return st;
+}
+
+void MemTable::set_dict_passthrough_reverse_dicts(
+        const phmap::flat_hash_map<std::string, std::vector<Slice>>* passthrough_source_dicts) {
+    if (passthrough_source_dicts == nullptr || _slot_descs == nullptr) {
+        return;
+    }
+    for (int i = 0; i < static_cast<int>(_slot_descs->size()); i++) {
+        const auto& slot = (*_slot_descs)[i];
+        auto it = passthrough_source_dicts->find(slot->col_name());
+        if (it != passthrough_source_dicts->end()) {
+            _passthrough_reverse_dicts[i] = it->second;
+        }
+    }
 }
 
 } // namespace starrocks

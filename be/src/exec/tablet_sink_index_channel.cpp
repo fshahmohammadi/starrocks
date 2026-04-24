@@ -216,16 +216,32 @@ void NodeChannel::_open(int64_t index_id, RefCountClosure<PTabletWriterOpenResul
     request.mutable_load_channel_profile_config()->CopyFrom(_parent->_load_channel_profile_config);
 
     // set global dict
-    const auto& global_dict = _runtime_state->get_load_global_dict_map();
+    const auto& load_dict = _runtime_state->get_load_global_dict_map();
+    const auto& query_dict = _runtime_state->get_query_global_dict_map();
     const auto& dict_version = _runtime_state->load_dict_versions();
+    const auto& source_slot_map = _runtime_state->dict_passthrough_source_slot_map();
     for (size_t i = 0; i < request.schema().slot_descs_size(); i++) {
         auto slot = request.mutable_schema()->mutable_slot_descs(i);
-        auto it = global_dict.find(slot->id());
-        if (it != global_dict.end()) {
-            auto dict = it->second.first;
-            for (auto& item : dict) {
+        // Send load dict (target table dict) for validation
+        auto it = load_dict.find(slot->id());
+        if (it != load_dict.end()) {
+            const auto& dict = it->second.first;
+            for (const auto& item : dict) {
                 slot->add_global_dict_words(item.first.to_string());
             }
+        }
+        // Passthrough: also send source dict for code mapping
+        auto source_it = source_slot_map.find(slot->id());
+        if (source_it != source_slot_map.end()) {
+            int32_t dict_ref_slot_id = source_it->second;
+            auto qit = query_dict.find(dict_ref_slot_id);
+            if (qit != query_dict.end()) {
+                const auto& rdict = qit->second.second;
+                for (DictId code = 1; code <= static_cast<DictId>(rdict.size()); code++) {
+                    slot->add_passthrough_source_dict_words(rdict.at(code).to_string());
+                }
+            }
+            slot->set_is_dict_passthrough(true);
         }
         auto it_version = dict_version.find(slot->id());
         if (it_version != dict_version.end()) {

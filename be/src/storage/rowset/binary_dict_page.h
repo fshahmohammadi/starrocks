@@ -37,6 +37,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "gen_cpp/segment.pb.h"
 #include "gutil/hash/string_hash.h"
@@ -90,6 +91,10 @@ public:
     // write, i.e, after `finish` has been called.
     bool all_dict_encoded() const override { return _encoding_type == DICT_ENCODING; }
 
+    // Dict-passthrough: add source INT codes by mapping them to local dict codes.
+    // |source_dict| is 1-based (index 0 unused). Returns number of codes consumed.
+    uint32_t add_codes(const int32_t* codes, uint32_t count, const std::vector<Slice>& source_dict);
+
 private:
     struct HashOfSlice {
         // Enable heterogeneous lookup.
@@ -118,6 +123,9 @@ private:
     // query for dict item -> dict id
     phmap::flat_hash_map<std::string, uint32_t, HashOfSlice, Eq> _dictionary;
     faststring _first_value;
+
+    // Dict-passthrough: source code -> local dict code cache.
+    phmap::flat_hash_map<int32_t, uint32_t> _code_mapping;
 };
 
 template <LogicalType Type>
