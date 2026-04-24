@@ -39,6 +39,7 @@
 
 #include "base/hash/crc32c.h"
 #include "base/string/faststring.h"
+#include "column/array_column.h"
 #include "column/binary_column.h"
 #include "column/chunk.h"
 #include "column/fixed_length_column.h"
@@ -217,8 +218,11 @@ Status SegmentWriter::init(const std::vector<uint32_t>& column_indexes, bool has
                 _global_dict_columns_valid_info[iter->first] = true;
             }
         }
-        // Dict-passthrough: use pre-built reverse dict from source dict
-        if (column.type() == LogicalType::TYPE_VARCHAR && _opts.passthrough_source_dicts != nullptr) {
+        // Dict-passthrough: use pre-built reverse dict from source dict.
+        // For scalar VARCHAR columns, set directly on the writer opts.
+        // For ARRAY<VARCHAR> columns, set on opts so create_array_column_writer
+        // can propagate it to the element writer.
+        if (_opts.passthrough_source_dicts != nullptr) {
             auto iter = _opts.passthrough_source_dicts->find(column.name().data());
             if (iter != _opts.passthrough_source_dicts->end()) {
                 opts.source_dict_for_passthrough = &iter->second;
@@ -449,28 +453,76 @@ Status SegmentWriter::append_chunk(const Chunk& chunk) {
                     continue;
                 }
                 auto& source_dict = pt_it->second;
-                const auto* src_col = chunk.get_column_raw_ptr_by_index(i);
+                const auto* src_col = chunk.get_column_by_index(i).get();
                 bool is_nullable = src_col->is_nullable();
-                const Int32Column* codes_col;
-                const NullColumn* null_col = nullptr;
-                if (is_nullable) {
-                    auto* nullable = down_cast<const NullableColumn*>(src_col);
-                    codes_col = down_cast<const Int32Column*>(nullable->data_column().get());
-                    null_col = nullable->null_column().get();
+
+                // Check if this is an ARRAY column (original tablet schema type)
+                if (_tablet_schema->column(i).type() == LogicalType::TYPE_ARRAY) {
+                    // ARRAY<INT> passthrough -> ARRAY<VARCHAR>: decode element codes
+                    const ArrayColumn* array_col;
+                    const NullColumn* null_col = nullptr;
+                    if (is_nullable) {
+                        auto* nullable = down_cast<const NullableColumn*>(src_col);
+                        array_col = down_cast<const ArrayColumn*>(nullable->data_column().get());
+                        null_col = nullable->null_column().get();
+                    } else {
+                        array_col = down_cast<const ArrayColumn*>(src_col);
+                    }
+                    const auto& elements = array_col->elements();
+                    const Int32Column* elem_codes;
+                    const NullColumn* elem_null_col = nullptr;
+                    bool elements_nullable = elements.is_nullable();
+                    if (elements_nullable) {
+                        auto* elem_nullable = down_cast<const NullableColumn*>(&elements);
+                        elem_codes = down_cast<const Int32Column*>(elem_nullable->data_column().get());
+                        elem_null_col = elem_nullable->null_column().get();
+                    } else {
+                        elem_codes = down_cast<const Int32Column*>(&elements);
+                    }
+                    auto decoded_elements = BinaryColumn::create();
+                    decoded_elements->reserve(elem_codes->size());
+                    for (size_t r = 0; r < elem_codes->size(); r++) {
+                        int32_t code = elem_codes->get_data()[r];
+                        DCHECK(code >= 0 && code < source_dict.size());
+                        decoded_elements->append(source_dict[code]);
+                    }
+                    ColumnPtr final_elements;
+                    if (elements_nullable) {
+                        final_elements = NullableColumn::create(decoded_elements, elem_null_col->clone());
+                    } else {
+                        final_elements = decoded_elements;
+                    }
+                    auto decoded_array = ArrayColumn::create(
+                            final_elements,
+                            array_col->offsets_column());
+                    if (is_nullable) {
+                        value_columns.emplace_back(NullableColumn::create(decoded_array, null_col->clone()));
+                    } else {
+                        value_columns.emplace_back(decoded_array);
+                    }
                 } else {
-                    codes_col = down_cast<const Int32Column*>(src_col);
-                }
-                auto decoded = BinaryColumn::create();
-                decoded->reserve(codes_col->size());
-                for (size_t r = 0; r < codes_col->size(); r++) {
-                    int32_t code = codes_col->get_data()[r];
-                    DCHECK(code >= 0 && code < source_dict.size());
-                    decoded->append(source_dict[code]);
-                }
-                if (is_nullable) {
-                    value_columns.emplace_back(NullableColumn::create(decoded, null_col->clone()));
-                } else {
-                    value_columns.emplace_back(decoded);
+                    // Scalar INT passthrough -> VARCHAR: decode codes
+                    const Int32Column* codes_col;
+                    const NullColumn* null_col = nullptr;
+                    if (is_nullable) {
+                        auto* nullable = down_cast<const NullableColumn*>(src_col);
+                        codes_col = down_cast<const Int32Column*>(nullable->data_column().get());
+                        null_col = nullable->null_column().get();
+                    } else {
+                        codes_col = down_cast<const Int32Column*>(src_col);
+                    }
+                    auto decoded = BinaryColumn::create();
+                    decoded->reserve(codes_col->size());
+                    for (size_t r = 0; r < codes_col->size(); r++) {
+                        int32_t code = codes_col->get_data()[r];
+                        DCHECK(code >= 0 && code < source_dict.size());
+                        decoded->append(source_dict[code]);
+                    }
+                    if (is_nullable) {
+                        value_columns.emplace_back(NullableColumn::create(decoded, null_col->clone()));
+                    } else {
+                        value_columns.emplace_back(decoded);
+                    }
                 }
             }
             RETURN_IF_ERROR(row_encoder->encode_columns_to_full_row_column(*_schema_without_full_row_column,

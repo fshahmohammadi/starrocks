@@ -810,7 +810,24 @@ Status ScalarColumnWriter::_append_impl(const uint8_t* data, const uint8_t* null
         };
 
         if (_curr_page_format == 2) {
-            num_written = add_to_page(data, remaining);
+            if constexpr (IsPassthrough) {
+                // Page format 2 sends all data (including null positions) to add_codes.
+                // Null-position codes in Int32Column may be garbage values that are
+                // out of range for source_dict. Sanitize by replacing them with 0.
+                if (has_null && null_flags != nullptr) {
+                    const auto* orig = reinterpret_cast<const int32_t*>(data);
+                    _passthrough_sanitized_codes.resize(remaining);
+                    for (size_t j = 0; j < remaining; j++) {
+                        _passthrough_sanitized_codes[j] = null_flags[j] ? 0 : orig[j];
+                    }
+                    num_written = dict_pb->add_codes(_passthrough_sanitized_codes.data(), remaining,
+                                                     *source_dict);
+                } else {
+                    num_written = add_to_page(data, remaining);
+                }
+            } else {
+                num_written = add_to_page(data, remaining);
+            }
             page_full = num_written < remaining;
             if (_null_map_builder_v2 != nullptr) {
                 _null_map_builder_v2->add_null_flags(null_flags, num_written);

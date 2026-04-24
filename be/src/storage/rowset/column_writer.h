@@ -328,6 +328,9 @@ private:
     uint64_t _total_mem_footprint = 0;
 
     Buffer<Slice> _slice_buf;
+    // Temporary buffer for dict-passthrough: holds sanitized codes (null positions zeroed out)
+    // for page format 2 where all data including nulls is sent to add_codes.
+    std::vector<int32_t> _passthrough_sanitized_codes;
 };
 
 } // namespace starrocks
