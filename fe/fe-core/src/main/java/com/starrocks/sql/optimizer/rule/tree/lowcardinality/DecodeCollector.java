@@ -330,7 +330,6 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
         context.unionDictionaryManager = unionDictionaryManager;
 
         context.sinkPassthroughCandidateIds.union(sinkPassthroughCandidates);
-        context.sinkPassthroughCandidateIds.except(disableRewriteStringColumns);
 
         // choose the profitable string columns
         for (Integer cid : scanStringColumns) {
