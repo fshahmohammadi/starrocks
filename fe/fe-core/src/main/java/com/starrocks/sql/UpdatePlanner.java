@@ -72,7 +72,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 
 public class UpdatePlanner {
 
@@ -107,7 +106,7 @@ public class UpdatePlanner {
             optimizerContext.setUpdateTableId(tableId);
 
             // Dict passthrough: compute passthrough candidates (non-key assigned columns)
-            List<ColumnRefOperator> passthroughColumns = InsertPlanner.computeSinkCandidatePassthroughColumns(
+            List<ColumnRefOperator> passthroughColumns = DictPassthroughPlannerUtil.computeSinkCandidatePassthroughColumns(
                     session.getSessionVariable(), targetTable, outputColumns, colNames);
             optimizerContext.setSinkPassthroughCandidateOutputColumns(passthroughColumns);
 
@@ -119,7 +118,7 @@ public class UpdatePlanner {
 
             Map<String, Integer> passthroughColumnToDictRefSlotId = new HashMap<>();
             Map<Integer, Integer> passthroughSourceSlotMap = new HashMap<>();
-            List<ColumnRefOperator> effectiveOutputColumns = InsertPlanner.buildEffectiveOutputColumns(
+            List<ColumnRefOperator> effectiveOutputColumns = DictPassthroughPlannerUtil.buildEffectiveOutputColumns(
                     optimizerContext.getSinkDictPassthroughResult(),
                     outputColumns, buildUpdatedSchema(targetTable, updateStmt),
                     columnRefFactory, passthroughColumnToDictRefSlotId);
@@ -180,7 +179,7 @@ public class UpdatePlanner {
                 sinkFragment.setSink(dataSink);
                 sinkFragment.setLoadGlobalDicts(globalDicts);
 
-                InsertPlanner.wireDictPassthrough(passthroughSourceSlotMap,
+                DictPassthroughPlannerUtil.wireDictPassthrough(passthroughSourceSlotMap,
                         passthroughColumnToDictRefSlotId.keySet(), dataSink, sinkFragment, execPlan);
 
                 // if sink is OlapTableSink Assigned to Be execute this sql [cn execute OlapTableSink will crash]
