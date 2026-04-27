@@ -153,6 +153,7 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
 
     private final SessionVariable sessionVariable;
     private final boolean isQuery;
+    private final Collection<ColumnRefOperator> sinkPassthroughCandidates;
 
     // These fields are the same as the fields in the DecodeContext,
     // the difference: these fields store all string information, the
@@ -202,9 +203,11 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
     // check if there is a blocking node in plan
     private boolean canBlockingOutput = false;
 
-    public DecodeCollector(SessionVariable session, boolean isQuery) {
+    public DecodeCollector(SessionVariable session, boolean isQuery,
+                           Collection<ColumnRefOperator> sinkPassthroughCandidates) {
         this.sessionVariable = session;
         this.isQuery = isQuery;
+        this.sinkPassthroughCandidates = sinkPassthroughCandidates;
         unionDictionaryManager = new UnionDictionaryManager(
                 sessionVariable, stringRefToDefineExprMap, globalDicts, joinEqColumnGroupIds);
     }
@@ -354,6 +357,14 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
                 context.allStringColumns.add(cid);
             } else if (allExprNum > worthless && allExprNum >= worthless * 2) {
                 context.allStringColumns.add(cid);
+            }
+        }
+        // Sink passthrough: force-enable dictification for candidate columns
+        for (ColumnRefOperator ref : sinkPassthroughCandidates) {
+            int cid = ref.getId();
+            if (!disableRewriteStringColumns.contains(cid)) {
+                context.allStringColumns.add(cid);
+                context.sinkPassthroughCandidateIds.union(cid);
             }
         }
         // resolve depend-on relation:

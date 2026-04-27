@@ -38,15 +38,15 @@ public class LowCardinalityRewriteRule implements TreeRewriteRule {
         ColumnRefFactory factory = optimizerContext.getColumnRefFactory();
         DecodeContext context = new DecodeContext(factory);
         {
-            DecodeCollector collector = new DecodeCollector(session, isQuery);
+            DecodeCollector collector = new DecodeCollector(session, isQuery,
+                    optimizerContext.getSinkPassthroughCandidateOutputColumns());
             collector.collect(root, context);
             if (!collector.isValidMatchChildren()) {
                 return root;
             }
         }
         DecodeRewriter rewriter = new DecodeRewriter(factory, context, session);
-        Pair<OptExpression, Map<Integer, Integer>> result =
-                rewriter.rewrite(root, optimizerContext.getSinkPassthroughCandidateOutputColumns());
+        Pair<OptExpression, Map<Integer, Integer>> result = rewriter.rewrite(root);
         optimizerContext.setSinkDictPassthroughResult(result.second);
         return result.first;
     }

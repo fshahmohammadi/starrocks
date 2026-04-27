@@ -31,6 +31,7 @@ import com.starrocks.sql.optimizer.operator.scalar.DictMappingOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.operator.scalar.SubfieldOperator;
 import com.starrocks.sql.optimizer.rewrite.BaseScalarOperatorShuttle;
+import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.statistics.ColumnDict;
 import com.starrocks.type.ArrayType;
 import com.starrocks.type.IntegerType;
@@ -100,6 +101,9 @@ class DecodeContext {
     Map<ColumnRefOperator, ColumnRefOperator> stringRefToDictRefMap = Maps.newHashMap();
 
     Map<ColumnRefOperator, ScalarOperator> dictRefToDefineExprMap = Maps.newHashMap();
+
+    // Sink passthrough candidate column ref IDs — these columns skip decode
+    ColumnRefSet sinkPassthroughCandidateIds = new ColumnRefSet();
 
     Map<ScalarOperator, ScalarOperator> stringExprToDictExprMap = Maps.newHashMap();
 

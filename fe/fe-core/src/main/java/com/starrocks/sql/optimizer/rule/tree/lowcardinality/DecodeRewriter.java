@@ -63,7 +63,6 @@ import com.starrocks.type.Type;
 import org.apache.commons.collections4.CollectionUtils;
 import org.jetbrains.annotations.NotNull;
 
-import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -103,8 +102,7 @@ public class DecodeRewriter extends OptExpressionVisitor<OptExpression, ColumnRe
         return result;
     }
 
-    public Pair<OptExpression, Map<Integer, Integer>> rewrite(OptExpression optExpression,
-                                                               Collection<ColumnRefOperator> sinkPassthroughCandidateOutputColumns) {
+    public Pair<OptExpression, Map<Integer, Integer>> rewrite(OptExpression optExpression) {
         if (context.allStringColumns.isEmpty()) {
             return Pair.create(optExpression, Map.of());
         }
@@ -118,13 +116,11 @@ public class DecodeRewriter extends OptExpressionVisitor<OptExpression, ColumnRe
         optExpression = rewriteImpl(optExpression, new ColumnRefSet());
         if (!decodeInfo.outputStringColumns.isEmpty()) {
             ColumnRefSet columnsToDecode = decodeInfo.outputStringColumns;
-            // Dict passthrough: exclude columns that go directly to an OlapTableSink
             Map<Integer, Integer> passthroughResult = new HashMap<>();
-            if (sessionVariable.isEnableDictPassthroughSink()
-                    && !sinkPassthroughCandidateOutputColumns.isEmpty()) {
+            // Dict passthrough: exclude candidate columns from decode
+            if (!context.sinkPassthroughCandidateIds.isEmpty()) {
                 columnsToDecode = columnsToDecode.clone();
-                for (ColumnRefOperator outputRef : sinkPassthroughCandidateOutputColumns) {
-                    int stringId = outputRef.getId();
+                for (int stringId : context.sinkPassthroughCandidateIds.getColumnIds()) {
                     if (columnsToDecode.contains(stringId)) {
                         ColumnRefOperator stringRef = factory.getColumnRef(stringId);
                         ColumnRefOperator dictRef = context.stringRefToDictRefMap.get(stringRef);
