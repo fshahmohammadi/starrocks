@@ -329,6 +329,11 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
         unionDictionaryManager.finalizeColumnDictionaries();
         context.unionDictionaryManager = unionDictionaryManager;
 
+        // Sink passthrough candidates: always considered profitable
+        ColumnRefSet passthroughCandidates = new ColumnRefSet(sinkPassthroughCandidates);
+        passthroughCandidates.except(disableRewriteStringColumns);
+        context.sinkPassthroughCandidateIds.union(passthroughCandidates);
+
         // choose the profitable string columns
         for (Integer cid : scanStringColumns) {
             if (disableRewriteStringColumns.contains(cid)) {
@@ -337,7 +342,8 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
             if (matchChildren.contains(cid)) {
                 continue;
             }
-            if (expressionStringRefCounter.getOrDefault(cid, 0) > 1) {
+            if (passthroughCandidates.contains(cid)
+                    || expressionStringRefCounter.getOrDefault(cid, 0) > 1) {
                 context.allStringColumns.add(cid);
                 continue;
             }
@@ -357,14 +363,6 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
                 context.allStringColumns.add(cid);
             } else if (allExprNum > worthless && allExprNum >= worthless * 2) {
                 context.allStringColumns.add(cid);
-            }
-        }
-        // Sink passthrough: force-enable dictification for candidate columns
-        for (ColumnRefOperator ref : sinkPassthroughCandidates) {
-            int cid = ref.getId();
-            if (!disableRewriteStringColumns.contains(cid)) {
-                context.allStringColumns.add(cid);
-                context.sinkPassthroughCandidateIds.union(cid);
             }
         }
         // resolve depend-on relation:
