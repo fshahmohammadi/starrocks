@@ -153,7 +153,7 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
 
     private final SessionVariable sessionVariable;
     private final boolean isQuery;
-    private final Collection<ColumnRefOperator> sinkPassthroughCandidates;
+    private final ColumnRefSet sinkPassthroughCandidates;
 
     // These fields are the same as the fields in the DecodeContext,
     // the difference: these fields store all string information, the
@@ -207,7 +207,7 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
                            Collection<ColumnRefOperator> sinkPassthroughCandidates) {
         this.sessionVariable = session;
         this.isQuery = isQuery;
-        this.sinkPassthroughCandidates = sinkPassthroughCandidates;
+        this.sinkPassthroughCandidates = new ColumnRefSet(sinkPassthroughCandidates);
         unionDictionaryManager = new UnionDictionaryManager(
                 sessionVariable, stringRefToDefineExprMap, globalDicts, joinEqColumnGroupIds);
     }
@@ -329,10 +329,8 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
         unionDictionaryManager.finalizeColumnDictionaries();
         context.unionDictionaryManager = unionDictionaryManager;
 
-        // Sink passthrough candidates: always considered profitable
-        ColumnRefSet passthroughCandidates = new ColumnRefSet(sinkPassthroughCandidates);
-        passthroughCandidates.except(disableRewriteStringColumns);
-        context.sinkPassthroughCandidateIds.union(passthroughCandidates);
+        context.sinkPassthroughCandidateIds.union(sinkPassthroughCandidates);
+        context.sinkPassthroughCandidateIds.except(disableRewriteStringColumns);
 
         // choose the profitable string columns
         for (Integer cid : scanStringColumns) {
@@ -342,7 +340,7 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
             if (matchChildren.contains(cid)) {
                 continue;
             }
-            if (passthroughCandidates.contains(cid)
+            if (context.sinkPassthroughCandidateIds.contains(cid)
                     || expressionStringRefCounter.getOrDefault(cid, 0) > 1) {
                 context.allStringColumns.add(cid);
                 continue;
@@ -382,7 +380,7 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
             }
             // Structs which pass checkDependOnExpr have at least one encoded field. We keep the structs encoded.
             if (globalDicts.containsKey(cid) || expressionStringRefCounter.getOrDefault(cid, 0) != 0
-                    || defineExpr.getType().isStructType()) {
+                    || defineExpr.getType().isStructType() || context.sinkPassthroughCandidateIds.contains(cid)) {
                 context.allStringColumns.add(cid);
             }
         });
