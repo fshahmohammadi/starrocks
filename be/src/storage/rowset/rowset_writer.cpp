@@ -125,7 +125,8 @@ Status RowsetWriter::init() {
     _writer_options.segment_file_mark.rowset_path_prefix = _context.rowset_path_prefix;
     _writer_options.segment_file_mark.rowset_id = _context.rowset_id.to_string();
 
-    _writer_options.global_dicts = _context.global_dicts != nullptr ? _context.global_dicts : nullptr;
+    _writer_options.global_dicts = _context.global_dicts;
+    _writer_options.passthrough_source_dicts = _context.passthrough_source_dicts;
     _writer_options.referenced_column_ids = _context.referenced_column_ids;
     _writer_options.is_compaction = _context.is_compaction;
     _writer_options.flat_json_config = _context.flat_json_config;

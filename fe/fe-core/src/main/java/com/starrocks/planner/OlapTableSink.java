@@ -162,6 +162,7 @@ public class OlapTableSink extends DataSink {
     private boolean enableDynamicOverwrite = false;
     private boolean isFromOverwrite = false;
     private boolean isMultiStatementTxn = false;
+    private Collection<String> dictPassthroughColumnNames = List.of();
 
     public OlapTableSink(OlapTable dstTable, TupleDescriptor tupleDescriptor, List<Long> partitionIds,
                          TWriteQuorumType writeQuorum, boolean enableReplicatedStorage,
@@ -266,6 +267,10 @@ public class OlapTableSink extends DataSink {
 
     public void setIsMultiStatementsTxn(boolean isMultiStatementTxn) {
         this.isMultiStatementTxn = isMultiStatementTxn;
+    }
+
+    public void setDictPassthroughColumnNames(Collection<String> columnNames) {
+        this.dictPassthroughColumnNames = columnNames;
     }
 
     public void complete(String mergeCondition) throws StarRocksException {
@@ -418,6 +423,10 @@ public class OlapTableSink extends DataSink {
         strBuilder.append(prefix + "OLAP TABLE SINK\n");
         strBuilder.append(prefix + "  TABLE: " + dstTable.getName() + "\n");
         strBuilder.append(prefix + "  TUPLE ID: " + tupleDescriptor.getId() + "\n");
+        if (!dictPassthroughColumnNames.isEmpty()) {
+            strBuilder.append(prefix + "  DICT PASSTHROUGH: " +
+                    String.join(", ", dictPassthroughColumnNames) + "\n");
+        }
         strBuilder.append(prefix + "  " + DataPartition.RANDOM.getExplainString(explainLevel));
         return strBuilder.toString();
     }

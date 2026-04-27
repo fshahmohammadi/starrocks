@@ -54,6 +54,7 @@ import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.rewrite.ScalarOperatorRewriter;
 import com.starrocks.sql.optimizer.rewrite.scalar.FoldConstantsRule;
 import com.starrocks.sql.optimizer.rewrite.scalar.ScalarOperatorRewriteRule;
+import com.starrocks.sql.optimizer.rule.tree.lowcardinality.DecodeUtil;
 import com.starrocks.sql.optimizer.statistics.ColumnDict;
 import com.starrocks.sql.optimizer.statistics.IDictManager;
 import com.starrocks.sql.optimizer.transformer.LogicalPlan;
@@ -63,7 +64,9 @@ import com.starrocks.sql.plan.ExecPlan;
 import com.starrocks.sql.plan.PlanFragmentBuilder;
 import com.starrocks.thrift.TPartialUpdateMode;
 import com.starrocks.thrift.TResultSinkType;
+import com.starrocks.type.Type;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
@@ -102,13 +105,26 @@ public class UpdatePlanner {
             OptimizerContext optimizerContext = OptimizerFactory.initContext(session, columnRefFactory);
             optimizerContext.setUpdateTableId(tableId);
 
+            // Dict passthrough: compute passthrough candidates (non-key assigned columns)
+            List<ColumnRefOperator> passthroughColumns = DictPassthroughPlannerUtil.computeSinkCandidatePassthroughColumns(
+                    session.getSessionVariable(), targetTable, outputColumns, colNames);
+            optimizerContext.setSinkPassthroughCandidateOutputColumns(passthroughColumns);
+
             Optimizer optimizer = OptimizerFactory.create(optimizerContext);
             OptExpression optimizedPlan = optimizer.optimize(
                     optExprBuilder.getRoot(),
                     new PhysicalPropertySet(),
                     new ColumnRefSet(outputColumns));
+
+            Map<String, Integer> passthroughColumnToDictRefSlotId = new HashMap<>();
+            Map<Integer, Integer> passthroughSourceSlotMap = new HashMap<>();
+            List<ColumnRefOperator> effectiveOutputColumns = DictPassthroughPlannerUtil.buildEffectiveOutputColumns(
+                    optimizerContext.getSinkDictPassthroughResult(),
+                    outputColumns, buildUpdatedSchema(targetTable, updateStmt),
+                    columnRefFactory, passthroughColumnToDictRefSlotId);
+
             ExecPlan execPlan = PlanFragmentBuilder.createPhysicalPlan(optimizedPlan, session,
-                    outputColumns, columnRefFactory, colNames, TResultSinkType.MYSQL_PROTOCAL, false);
+                    effectiveOutputColumns, columnRefFactory, colNames, TResultSinkType.MYSQL_PROTOCAL, false);
             DescriptorTable descriptorTable = execPlan.getDescTbl();
             TupleDescriptor olapTuple = descriptorTable.createTupleDescriptor();
 
@@ -122,9 +138,17 @@ public class UpdatePlanner {
                 }
                 SlotDescriptor slotDescriptor = descriptorTable.addSlotDescriptor(olapTuple);
                 slotDescriptor.setIsMaterialized(true);
-                slotDescriptor.setType(column.getType());
                 slotDescriptor.setColumn(column);
                 slotDescriptor.setIsNullable(column.isAllowNull());
+                Integer dictRefSlotId = passthroughColumnToDictRefSlotId.get(column.getName());
+                if (dictRefSlotId != null) {
+                    Type dictType = DecodeUtil.getDictifiedType(column.getType());
+                    slotDescriptor.setType(dictType);
+                    slotDescriptor.setOriginType(dictType);
+                    passthroughSourceSlotMap.put(slotDescriptor.getId().asInt(), dictRefSlotId);
+                } else {
+                    slotDescriptor.setType(column.getType());
+                }
                 if (column.getType().isVarchar() &&
                         IDictManager.getInstance().hasGlobalDict(tableId, column.getColumnId())) {
                     Optional<ColumnDict> dict = IDictManager.getInstance().getGlobalDict(tableId, column.getColumnId());
@@ -151,8 +175,12 @@ public class UpdatePlanner {
                     ((OlapTableSink) dataSink).setIsMultiStatementsTxn(true);
                 }
 
-                execPlan.getFragments().get(0).setSink(dataSink);
-                execPlan.getFragments().get(0).setLoadGlobalDicts(globalDicts);
+                PlanFragment sinkFragment = execPlan.getFragments().get(0);
+                sinkFragment.setSink(dataSink);
+                sinkFragment.setLoadGlobalDicts(globalDicts);
+
+                DictPassthroughPlannerUtil.wireDictPassthrough(passthroughSourceSlotMap,
+                        passthroughColumnToDictRefSlotId.keySet(), dataSink, sinkFragment, execPlan);
 
                 // if sink is OlapTableSink Assigned to Be execute this sql [cn execute OlapTableSink will crash]
                 session.getSessionVariable().setPreferComputeNode(false);
@@ -244,5 +272,21 @@ public class UpdatePlanner {
             }
         }
         return root.withNewRoot(new LogicalProjectOperator(new HashMap<>(columnRefMap)));
+    }
+
+    /**
+     * Build the column schema in the same order as outputColumns for UPDATE.
+     * For partial update: key columns + assigned columns, in full schema order.
+     */
+    private List<Column> buildUpdatedSchema(Table targetTable, UpdateStmt updateStmt) {
+        List<Column> result = new ArrayList<>();
+        for (Column column : targetTable.getFullSchema()) {
+            if (updateStmt.usePartialUpdate() && !column.isGeneratedColumn() &&
+                    !updateStmt.isAssignmentColumn(column.getName()) && !column.isKey()) {
+                continue;
+            }
+            result.add(column);
+        }
+        return result;
     }
 }

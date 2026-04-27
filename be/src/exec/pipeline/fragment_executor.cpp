@@ -854,6 +854,22 @@ Status FragmentExecutor::_prepare_global_dict(const UnifiedExecPlanFragmentParam
     if (fragment.__isset.load_global_dicts) {
         RETURN_IF_ERROR(fragment_dict_state->init_load_global_dict(runtime_state, fragment.load_global_dicts));
     }
+
+    if (fragment.__isset.dict_passthrough_source_slot_map) {
+        fragment_dict_state->set_dict_passthrough_source_slot_map(
+                {fragment.dict_passthrough_source_slot_map.begin(),
+                 fragment.dict_passthrough_source_slot_map.end()});
+        // Eagerly evaluate dict exprs for passthrough columns whose derived dicts
+        // aren't yet in query_global_dicts (e.g., DictDefine outputs like upper(col)).
+        auto* parser = fragment_dict_state->mutable_dict_optimize_parser();
+        const auto& source_slot_map = fragment_dict_state->dict_passthrough_source_slot_map();
+        const auto& query_dicts = fragment_dict_state->query_global_dicts();
+        for (const auto& [sink_slot, dict_ref_slot] : source_slot_map) {
+            if (query_dicts.count(dict_ref_slot) == 0) {
+                RETURN_IF_ERROR(parser->eval_dict_expr(runtime_state, dict_ref_slot));
+            }
+        }
+    }
     return Status::OK();
 }
 

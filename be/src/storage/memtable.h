@@ -16,11 +16,13 @@
 
 #include <atomic>
 #include <ostream>
+#include <unordered_map>
 
 #include "column/vectorized_fwd.h"
 #include "exec/sorting/sort_permute.h"
 #include "gen_cpp/data.pb.h"
 #include "gen_cpp/olap_file.pb.h"
+#include "runtime/global_dict/types.h"
 #include "storage/chunk_aggregator.h"
 #include "storage/olap_define.h"
 #include "storage/primary_key_encoding_types.h"
@@ -109,14 +111,19 @@ public:
 
     void set_write_buffer_row(size_t max_buffer_row) { _max_buffer_row = max_buffer_row; }
 
-    static Schema convert_schema(const TabletSchemaCSPtr& tablet_schema,
-                                 const std::vector<SlotDescriptor*>* slot_descs);
+    static Schema convert_schema(
+            const TabletSchemaCSPtr& tablet_schema, const std::vector<SlotDescriptor*>* slot_descs,
+            const phmap::flat_hash_map<std::string, std::vector<Slice>>* passthrough_source_dicts = nullptr);
 
     ChunkPtr get_result_chunk() { return _result_chunk; }
 
     bool check_supported_column_partial_update(const Chunk& chunk);
 
     const MemtableStats& get_stat() const { return _stats; }
+
+    // Set dict passthrough info for decoding INT codes before full_row_column encoding.
+    void set_dict_passthrough_reverse_dicts(
+            const phmap::flat_hash_map<std::string, std::vector<Slice>>* passthrough_source_dicts);
 
 private:
     Status _merge();
@@ -173,6 +180,10 @@ private:
 
     MemtableStats _stats;
     PrimaryKeyEncodingType _pk_encoding_type = PrimaryKeyEncodingType::PK_ENCODING_TYPE_NONE;
+
+    // Dict passthrough: column index in schema -> 1-based source dict vector for decoding INT codes.
+    // Used to decode passthrough columns before full_row_column encoding in PRIMARY_KEYS tables.
+    std::unordered_map<int, std::vector<Slice>> _passthrough_reverse_dicts;
 };
 
 inline std::ostream& operator<<(std::ostream& os, const MemTable& table) {

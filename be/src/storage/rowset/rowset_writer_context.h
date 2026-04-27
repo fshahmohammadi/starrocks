@@ -83,6 +83,7 @@ public:
     uint32_t max_rows_per_segment = INT32_MAX;
 
     GlobalDictByNameMaps* global_dicts = nullptr;
+    phmap::flat_hash_map<std::string, std::vector<Slice>>* passthrough_source_dicts = nullptr;
 
     RowsetWriterType writer_type = kHorizontal;
 

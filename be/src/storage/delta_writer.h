@@ -55,6 +55,8 @@ struct DeltaWriterOptions {
     // slots are in order of tablet's schema
     const std::vector<SlotDescriptor*>* slots;
     GlobalDictByNameMaps* global_dicts = nullptr;
+    // Source reverse dicts for dict-passthrough columns: column_name -> (code -> Slice).
+    phmap::flat_hash_map<std::string, std::vector<Slice>>* passthrough_source_dicts = nullptr;
     Span parent_span;
     int64_t index_id;
     int64_t node_id;

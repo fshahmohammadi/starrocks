@@ -112,6 +112,7 @@ import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.rewrite.ScalarOperatorRewriter;
 import com.starrocks.sql.optimizer.rewrite.scalar.FoldConstantsRule;
 import com.starrocks.sql.optimizer.rewrite.scalar.ScalarOperatorRewriteRule;
+import com.starrocks.sql.optimizer.rule.tree.lowcardinality.DecodeUtil;
 import com.starrocks.sql.optimizer.statistics.ColumnDict;
 import com.starrocks.sql.optimizer.statistics.IDictManager;
 import com.starrocks.sql.optimizer.transformer.ExpressionMapping;
@@ -161,6 +162,11 @@ public class InsertPlanner {
 
     private List<Column> outputBaseSchema;
     private List<Column> outputFullSchema;
+
+    // Dict passthrough: maps column name -> dictRef slot ID (the INT column's slot in the scan tuple).
+    // Columns in this map skip decode and pass INT codes directly to the sink.
+    // Used to build the sink slot ID -> dictRef slot ID mapping for query_global_dicts lookup.
+    private Map<String, Integer> passthroughColumnToDictRefSlotId = new HashMap<>();
 
     private static final Logger LOG = LogManager.getLogger(InsertPlanner.class);
 
@@ -390,13 +396,22 @@ public class InsertPlanner {
             TupleDescriptor tupleDesc = descriptorTable.createTupleDescriptor();
 
             List<Pair<Integer, ColumnDict>> globalDicts = Lists.newArrayList();
+            Map<Integer, Integer> passthroughSourceSlotMap = Maps.newHashMap();
             long tableId = targetTable.getId();
             for (Column column : outputFullSchema) {
                 SlotDescriptor slotDescriptor = descriptorTable.addSlotDescriptor(tupleDesc);
                 slotDescriptor.setIsMaterialized(true);
-                slotDescriptor.setType(column.getType());
                 slotDescriptor.setColumn(column);
                 slotDescriptor.setIsNullable(column.isAllowNull());
+                Integer dictRefSlotId = passthroughColumnToDictRefSlotId.get(column.getName());
+                if (dictRefSlotId != null) {
+                    Type dictType = DecodeUtil.getDictifiedType(column.getType());
+                    slotDescriptor.setType(dictType);
+                    slotDescriptor.setOriginType(dictType);
+                    passthroughSourceSlotMap.put(slotDescriptor.getId().asInt(), dictRefSlotId);
+                } else {
+                    slotDescriptor.setType(column.getType());
+                }
                 if (column.getType().isVarchar() &&
                         IDictManager.getInstance().hasGlobalDict(tableId, column.getColumnId())) {
                     Optional<ColumnDict> dict = IDictManager.getInstance().getGlobalDict(tableId, column.getColumnId());
@@ -553,6 +568,8 @@ public class InsertPlanner {
             }
             sinkFragment.setSink(dataSink);
             sinkFragment.setLoadGlobalDicts(globalDicts);
+            DictPassthroughPlannerUtil.wireDictPassthrough(passthroughSourceSlotMap,
+                    passthroughColumnToDictRefSlotId.keySet(), dataSink, sinkFragment, execPlan);
             return execPlan;
         }
     }
@@ -607,9 +624,15 @@ public class InsertPlanner {
 
         int sourceTablesCount = collectSourceTablesCount(session, insertStmt);
 
+        OptimizerContext optimizerContext;
         try (Timer ignore2 = Tracers.watchScope("Optimizer")) {
-            OptimizerContext optimizerContext = OptimizerFactory.initContext(session, columnRefFactory);
+            optimizerContext = OptimizerFactory.initContext(session, columnRefFactory);
             optimizerContext.setSourceTablesCount(sourceTablesCount);
+            // Dict passthrough: tell the optimizer which output columns don't need decode
+            List<ColumnRefOperator> passthroughColumns = DictPassthroughPlannerUtil.computeSinkCandidatePassthroughColumns(
+                    session.getSessionVariable(), targetTable, logicalPlan.getOutputColumn(),
+                    outputFullSchema.stream().map(Column::getName).collect(Collectors.toList()));
+            optimizerContext.setSinkPassthroughCandidateOutputColumns(passthroughColumns);
             Optimizer optimizer = OptimizerFactory.create(optimizerContext);
             optimizedPlan = optimizer.optimize(
                     preOptimizePlanContext.root,
@@ -617,13 +640,18 @@ public class InsertPlanner {
                     preOptimizePlanContext.requiredColumns);
         }
 
+        List<ColumnRefOperator> effectiveOutputColumns = DictPassthroughPlannerUtil.buildEffectiveOutputColumns(
+                optimizerContext.getSinkDictPassthroughResult(),
+                logicalPlan.getOutputColumn(), outputFullSchema,
+                columnRefFactory, passthroughColumnToDictRefSlotId);
+
         //8. Build fragment exec plan
         boolean hasOutputFragment = ((queryRelation instanceof SelectRelation && queryRelation.hasLimit())
                 || targetTable instanceof MysqlTable);
         ExecPlan execPlan;
         try (Timer ignore3 = Tracers.watchScope("PlanBuilder")) {
             execPlan = PlanFragmentBuilder.createPhysicalPlan(
-                    optimizedPlan, session, logicalPlan.getOutputColumn(), columnRefFactory,
+                    optimizedPlan, session, effectiveOutputColumns, columnRefFactory,
                     queryRelation.getColumnOutputNames(), TResultSinkType.MYSQL_PROTOCAL, hasOutputFragment);
         }
         return execPlan;

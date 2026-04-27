@@ -14,32 +14,40 @@
 
 package com.starrocks.sql.optimizer.rule.tree.lowcardinality;
 
+import com.starrocks.common.Pair;
 import com.starrocks.qe.SessionVariable;
 import com.starrocks.sql.optimizer.OptExpression;
+import com.starrocks.sql.optimizer.OptimizerContext;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
 import com.starrocks.sql.optimizer.rule.tree.TreeRewriteRule;
 import com.starrocks.sql.optimizer.task.TaskContext;
+
+import java.util.Map;
 
 public class LowCardinalityRewriteRule implements TreeRewriteRule {
 
     @Override
     public OptExpression rewrite(OptExpression root, TaskContext taskContext) {
-        SessionVariable session = taskContext.getOptimizerContext().getSessionVariable();
-        boolean isQuery = taskContext.getOptimizerContext().getConnectContext().getState().isQuery();
+        OptimizerContext optimizerContext = taskContext.getOptimizerContext();
+        SessionVariable session = optimizerContext.getSessionVariable();
+        boolean isQuery = optimizerContext.getConnectContext().getState().isQuery();
         if (!session.isEnableLowCardinalityOptimize() || !session.isUseLowCardinalityOptimizeV2()) {
             return root;
         }
 
-        ColumnRefFactory factory = taskContext.getOptimizerContext().getColumnRefFactory();
+        ColumnRefFactory factory = optimizerContext.getColumnRefFactory();
         DecodeContext context = new DecodeContext(factory);
         {
-            DecodeCollector collector = new DecodeCollector(session, isQuery);
+            DecodeCollector collector = new DecodeCollector(session, isQuery,
+                    optimizerContext.getSinkPassthroughCandidateOutputColumns());
             collector.collect(root, context);
             if (!collector.isValidMatchChildren()) {
                 return root;
             }
         }
         DecodeRewriter rewriter = new DecodeRewriter(factory, context, session);
-        return rewriter.rewrite(root);
+        Pair<OptExpression, Map<Integer, Integer>> result = rewriter.rewrite(root);
+        optimizerContext.setSinkDictPassthroughResult(result.second);
+        return result.first;
     }
 }

@@ -102,9 +102,9 @@ public class DecodeRewriter extends OptExpressionVisitor<OptExpression, ColumnRe
         return result;
     }
 
-    public OptExpression rewrite(OptExpression optExpression) {
+    public Pair<OptExpression, Map<Integer, Integer>> rewrite(OptExpression optExpression) {
         if (context.allStringColumns.isEmpty()) {
-            return optExpression;
+            return Pair.create(optExpression, Map.of());
         }
         context.initRewriteExpressions();
         // check output need decode
@@ -115,11 +115,31 @@ public class DecodeRewriter extends OptExpressionVisitor<OptExpression, ColumnRe
         // compute the fragment used dict expr
         optExpression = rewriteImpl(optExpression, new ColumnRefSet());
         if (!decodeInfo.outputStringColumns.isEmpty()) {
-            // decode the output dict column
-            return insertStructuredDecodeNode(optExpression, decodeInfo.outputStringColumns, decodeInfo.outputStringColumns);
+            ColumnRefSet columnsToDecode = decodeInfo.outputStringColumns;
+            Map<Integer, Integer> passthroughResult = new HashMap<>();
+            // Dict passthrough: exclude candidate columns from decode
+            if (!context.sinkPassthroughCandidateIds.isEmpty()) {
+                columnsToDecode = columnsToDecode.clone();
+                for (int stringId : context.sinkPassthroughCandidateIds.getColumnIds()) {
+                    if (columnsToDecode.contains(stringId)) {
+                        ColumnRefOperator stringRef = factory.getColumnRef(stringId);
+                        ColumnRefOperator dictRef = context.stringRefToDictRefMap.get(stringRef);
+                        if (dictRef != null) {
+                            columnsToDecode.except(new ColumnRefSet(stringId));
+                            passthroughResult.put(stringId, dictRef.getId());
+                        }
+                    }
+                }
+            }
+
+            if (!columnsToDecode.isEmpty()) {
+                optExpression = insertStructuredDecodeNode(optExpression,
+                        decodeInfo.outputStringColumns, columnsToDecode);
+            }
+            return Pair.create(optExpression, passthroughResult);
         }
 
-        return optExpression;
+        return Pair.create(optExpression, Map.of());
     }
 
     // fragmentUseDictExprs: record the dict columns used in this fragment, to

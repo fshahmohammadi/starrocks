@@ -79,6 +79,8 @@ struct SegmentWriterOptions {
     uint32_t num_rows_per_block = 1024;
 #endif
     GlobalDictByNameMaps* global_dicts = nullptr;
+    // column_name -> 1-based source dict vector (index 0 unused, source_dict[code] = Slice).
+    phmap::flat_hash_map<std::string, std::vector<Slice>>* passthrough_source_dicts = nullptr;
     std::vector<int32_t> referenced_column_ids;
     SegmentFileMark segment_file_mark;
     std::string encryption_meta;

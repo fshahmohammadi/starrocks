@@ -19,11 +19,11 @@ import com.starrocks.type.ArrayType;
 import com.starrocks.type.IntegerType;
 import com.starrocks.type.Type;
 
-final class DecodeUtil {
+public final class DecodeUtil {
 
     private DecodeUtil() {}
 
-    static Type getDictifiedType(Type type) {
+    public static Type getDictifiedType(Type type) {
         if (type == null) {
             return null;
         }

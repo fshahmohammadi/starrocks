@@ -252,6 +252,9 @@ private:
             _delta_writers_impl.delta_writers();
 
     GlobalDictByNameMaps _global_dicts;
+    // Passthrough source dicts: column_name -> 1-based source dict vector.
+    // source_dict[code] = Slice (index 0 unused). Used to resolve INT codes in passthrough columns.
+    phmap::flat_hash_map<std::string, std::vector<Slice>> _passthrough_source_dicts;
     std::unique_ptr<MemPool> _mem_pool;
 
     bool _is_replicated_storage = false;
