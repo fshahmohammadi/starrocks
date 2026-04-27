@@ -112,6 +112,7 @@ import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.rewrite.ScalarOperatorRewriter;
 import com.starrocks.sql.optimizer.rewrite.scalar.FoldConstantsRule;
 import com.starrocks.sql.optimizer.rewrite.scalar.ScalarOperatorRewriteRule;
+import com.starrocks.sql.optimizer.rule.tree.lowcardinality.DecodeUtil;
 import com.starrocks.sql.optimizer.statistics.ColumnDict;
 import com.starrocks.sql.optimizer.statistics.IDictManager;
 import com.starrocks.sql.optimizer.transformer.ExpressionMapping;
@@ -167,7 +168,6 @@ public class InsertPlanner {
     // Columns in this map skip decode and pass INT codes directly to the sink.
     // Used to build the sink slot ID -> dictRef slot ID mapping for query_global_dicts lookup.
     private Map<String, Integer> passthroughColumnToDictRefSlotId = new HashMap<>();
-    private Map<String, Type> passthroughColumnType = new HashMap<>();
 
     private static final Logger LOG = LogManager.getLogger(InsertPlanner.class);
 
@@ -406,11 +406,7 @@ public class InsertPlanner {
                 slotDescriptor.setIsNullable(column.isAllowNull());
                 Integer dictRefSlotId = passthroughColumnToDictRefSlotId.get(column.getName());
                 if (dictRefSlotId != null) {
-                    // Passthrough column: set slot type to the dict ref's type instead of the original.
-                    // For scalar VARCHAR this is INT; for ARRAY<VARCHAR> this is ARRAY<INT>.
-                    // Must set originType too because SlotDescriptor.toThrift() uses originType
-                    // when it's non-null (which setColumn() always sets).
-                    Type dictType = passthroughColumnType.get(column.getName());
+                    Type dictType = DecodeUtil.getDictifiedType(column.getType());
                     slotDescriptor.setType(dictType);
                     slotDescriptor.setOriginType(dictType);
                     passthroughSourceSlotMap.put(slotDescriptor.getId().asInt(), dictRefSlotId);
@@ -659,8 +655,6 @@ public class InsertPlanner {
                     ColumnRefOperator dictRefCol = columnRefFactory.getColumnRef(dictRefId);
                     passthroughColumnToDictRefSlotId.put(
                             outputFullSchema.get(i).getName(), dictRefId);
-                    passthroughColumnType.put(
-                            outputFullSchema.get(i).getName(), dictRefCol.getType());
                     effectiveOutputColumns.set(i, dictRefCol);
                 }
             }
