@@ -677,7 +677,8 @@ public class InsertPlanner {
         Set<String> keyColumnNames = getKeyColumnNames(olapTable);
         List<ColumnRefOperator> result = new ArrayList<>();
         for (int i = 0; i < columnNames.size(); i++) {
-            if (!keyColumnNames.contains(columnNames.get(i).toLowerCase())) {
+            if (!keyColumnNames.contains(columnNames.get(i).toLowerCase())
+                    && !outputColumns.get(i).getType().isStructType()) {
                 result.add(outputColumns.get(i));
             }
         }
