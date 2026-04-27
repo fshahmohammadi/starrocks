@@ -107,8 +107,8 @@ public class UpdatePlanner {
             optimizerContext.setUpdateTableId(tableId);
 
             // Dict passthrough: compute passthrough candidates (non-key assigned columns)
-            List<ColumnRefOperator> passthroughColumns = computeUpdatePassthroughColumns(
-                    targetTable, updateStmt, outputColumns, colNames);
+            List<ColumnRefOperator> passthroughColumns = InsertPlanner.computeSinkCandidatePassthroughColumns(
+                    targetTable, outputColumns, colNames);
             optimizerContext.setSinkPassthroughCandidateOutputColumns(passthroughColumns);
 
             Optimizer optimizer = OptimizerFactory.create(optimizerContext);
@@ -273,33 +273,6 @@ public class UpdatePlanner {
             }
         }
         return root.withNewRoot(new LogicalProjectOperator(new HashMap<>(columnRefMap)));
-    }
-
-    /**
-     * Compute passthrough candidates for UPDATE: non-key assigned columns.
-     * These columns can skip dict decoding and pass INT dict codes directly to the sink.
-     */
-    private List<ColumnRefOperator> computeUpdatePassthroughColumns(
-            Table targetTable, UpdateStmt updateStmt,
-            List<ColumnRefOperator> outputColumns, List<String> colNames) {
-        if (!(targetTable instanceof OlapTable)) {
-            return List.of();
-        }
-        // Dict passthrough is not supported in shared-data (lake/cloud-native) mode
-        // because the lake DeltaWriter does not support passthrough_source_dicts.
-        if (targetTable.isCloudNativeTableOrMaterializedView()) {
-            return List.of();
-        }
-        Set<String> keyColumnNames = InsertPlanner.getKeyColumnNames((OlapTable) targetTable);
-
-        List<ColumnRefOperator> result = new ArrayList<>();
-        for (int i = 0; i < outputColumns.size() && i < colNames.size(); i++) {
-            String colName = colNames.get(i).toLowerCase();
-            if (!keyColumnNames.contains(colName)) {
-                result.add(outputColumns.get(i));
-            }
-        }
-        return result;
     }
 
     /**

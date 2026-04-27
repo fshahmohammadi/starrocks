@@ -631,7 +631,8 @@ public class InsertPlanner {
             optimizerContext.setSourceTablesCount(sourceTablesCount);
             // Dict passthrough: tell the optimizer which output columns don't need decode
             List<ColumnRefOperator> passthroughColumns = computeSinkCandidatePassthroughColumns(
-                    targetTable, logicalPlan.getOutputColumn());
+                    targetTable, logicalPlan.getOutputColumn(),
+                    outputFullSchema.stream().map(Column::getName).collect(Collectors.toList()));
             optimizerContext.setSinkPassthroughCandidateOutputColumns(passthroughColumns);
             Optimizer optimizer = OptimizerFactory.create(optimizerContext);
             optimizedPlan = optimizer.optimize(
@@ -661,22 +662,22 @@ public class InsertPlanner {
      * Compute output column refs that are safe to keep dict-encoded for sink passthrough.
      * These are non-key VARCHAR columns on the target OlapTable.
      */
-    private List<ColumnRefOperator> computeSinkCandidatePassthroughColumns(Table targetTable,
-                                                                   List<ColumnRefOperator> outputColumns) {
+    /**
+     * Compute output column refs that are safe to keep dict-encoded for sink passthrough.
+     * These are non-key columns on the target OlapTable.
+     */
+    static List<ColumnRefOperator> computeSinkCandidatePassthroughColumns(
+            Table targetTable, List<ColumnRefOperator> outputColumns, List<String> columnNames) {
         if (!(targetTable instanceof OlapTable olapTable)) {
             return List.of();
         }
-        // Dict passthrough is not supported in shared-data (lake/cloud-native) mode
-        // because the lake DeltaWriter does not support passthrough_source_dicts.
         if (targetTable.isCloudNativeTableOrMaterializedView()) {
             return List.of();
         }
-        Preconditions.checkState(outputColumns.size() == outputFullSchema.size());
         Set<String> keyColumnNames = getKeyColumnNames(olapTable);
-
         List<ColumnRefOperator> result = new ArrayList<>();
-        for (int i = 0; i < outputFullSchema.size(); i++) {
-            if (!keyColumnNames.contains(outputFullSchema.get(i).getName().toLowerCase())) {
+        for (int i = 0; i < columnNames.size(); i++) {
+            if (!keyColumnNames.contains(columnNames.get(i).toLowerCase())) {
                 result.add(outputColumns.get(i));
             }
         }
