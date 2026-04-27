@@ -110,7 +110,7 @@ public class UpdatePlanner {
             // Dict passthrough: compute passthrough candidates (non-key assigned columns)
             List<ColumnRefOperator> passthroughColumns = computeUpdatePassthroughColumns(
                     targetTable, updateStmt, outputColumns, colNames);
-            optimizerContext.setSinkPassthroughOutputColumns(passthroughColumns);
+            optimizerContext.setSinkPassthroughCandidateOutputColumns(passthroughColumns);
 
             Optimizer optimizer = OptimizerFactory.create(optimizerContext);
             OptExpression optimizedPlan = optimizer.optimize(

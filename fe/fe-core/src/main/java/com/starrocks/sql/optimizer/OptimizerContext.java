@@ -83,7 +83,7 @@ public class OptimizerContext {
     // Dict passthrough for INSERT INTO...SELECT: output columns that are safe to keep
     // dict-encoded because they go directly to an OlapTableSink.
     // Set by InsertPlanner before optimization; read by DecodeRewriter.
-    private List<ColumnRefOperator> sinkPassthroughOutputColumns = List.of();
+    private List<ColumnRefOperator> sinkPassthroughCandidateOutputColumns = List.of();
     // Result: maps stringRefId -> dictRefId for columns that were actually kept as dict-encoded.
     // Set by LowCardinalityRewriteRule after DecodeRewriter; read by InsertPlanner.
     private Map<Integer, Integer> sinkDictPassthroughResult = Map.of();
@@ -282,11 +282,11 @@ public class OptimizerContext {
     }
 
     public List<ColumnRefOperator> getSinkPassthroughOutputColumns() {
-        return sinkPassthroughOutputColumns;
+        return sinkPassthroughCandidateOutputColumns;
     }
 
     public void setSinkPassthroughOutputColumns(List<ColumnRefOperator> columns) {
-        this.sinkPassthroughOutputColumns = columns;
+        this.sinkPassthroughCandidateOutputColumns = columns;
     }
 
     public Map<Integer, Integer> getSinkDictPassthroughResult() {

@@ -150,7 +150,7 @@ public class OlapTableSink extends DataSink {
     private long automaticBucketSize = 0;
     private boolean enableDynamicOverwrite = false;
     private boolean isFromOverwrite = false;
-    private List<String> dictPassthroughColumnNames = List.of();
+    private Collection<String> dictPassthroughColumnNames = List.of();
 
     public OlapTableSink(OlapTable dstTable, TupleDescriptor tupleDescriptor, List<Long> partitionIds,
                          TWriteQuorumType writeQuorum, boolean enableReplicatedStorage,
@@ -249,7 +249,7 @@ public class OlapTableSink extends DataSink {
         this.isFromOverwrite = isFromOverwrite;
     }
 
-    public void setDictPassthroughColumnNames(List<String> columnNames) {
+    public void setDictPassthroughColumnNames(Collection<String> columnNames) {
         this.dictPassthroughColumnNames = columnNames;
     }
 

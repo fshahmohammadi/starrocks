@@ -46,7 +46,7 @@ public class LowCardinalityRewriteRule implements TreeRewriteRule {
         }
         DecodeRewriter rewriter = new DecodeRewriter(factory, context, session);
         Pair<OptExpression, Map<Integer, Integer>> result =
-                rewriter.rewrite(root, optimizerContext.getSinkPassthroughOutputColumns());
+                rewriter.rewrite(root, optimizerContext.getSinkPassthroughCandidateOutputColumns());
         optimizerContext.setSinkDictPassthroughResult(result.second);
         return result.first;
     }
