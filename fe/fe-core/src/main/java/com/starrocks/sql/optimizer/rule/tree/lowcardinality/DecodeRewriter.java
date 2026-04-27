@@ -133,8 +133,8 @@ public class DecodeRewriter extends OptExpressionVisitor<OptExpression, ColumnRe
             }
 
             if (!columnsToDecode.isEmpty()) {
-                return Pair.create(insertStructuredDecodeNode(optExpression,
-                        decodeInfo.outputStringColumns, columnsToDecode), passthroughResult);
+                optExpression = insertStructuredDecodeNode(optExpression,
+                        decodeInfo.outputStringColumns, columnsToDecode);
             }
             return Pair.create(optExpression, passthroughResult);
         }
