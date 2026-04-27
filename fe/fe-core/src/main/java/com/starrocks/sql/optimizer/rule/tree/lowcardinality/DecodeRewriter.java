@@ -104,7 +104,7 @@ public class DecodeRewriter extends OptExpressionVisitor<OptExpression, ColumnRe
     }
 
     public Pair<OptExpression, Map<Integer, Integer>> rewrite(OptExpression optExpression,
-                                                               List<ColumnRefOperator> sinkPassthroughOutputColumns) {
+                                                               List<ColumnRefOperator> sinkPassthroughCandidateOutputColumns) {
         if (context.allStringColumns.isEmpty()) {
             return Pair.create(optExpression, Map.of());
         }
@@ -121,9 +121,9 @@ public class DecodeRewriter extends OptExpressionVisitor<OptExpression, ColumnRe
             // Dict passthrough: exclude columns that go directly to an OlapTableSink
             Map<Integer, Integer> passthroughResult = new HashMap<>();
             if (sessionVariable.isEnableDictPassthroughSink()
-                    && !sinkPassthroughOutputColumns.isEmpty()) {
+                    && !sinkPassthroughCandidateOutputColumns.isEmpty()) {
                 columnsToDecode = columnsToDecode.clone();
-                for (ColumnRefOperator outputRef : sinkPassthroughOutputColumns) {
+                for (ColumnRefOperator outputRef : sinkPassthroughCandidateOutputColumns) {
                     int stringId = outputRef.getId();
                     if (columnsToDecode.contains(stringId)) {
                         ColumnRefOperator stringRef = factory.getColumnRef(stringId);

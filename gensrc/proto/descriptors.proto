@@ -55,12 +55,9 @@ message PSlotDescriptor {
     optional int64 global_dict_version = 12;
     optional bool is_nullable = 13; // replace null_indicator_bit & null_indicator_byte
     optional bool is_virtual = 14;
-    // When true, this column's data contains INT dict codes (not strings).
-    // The column writer should use add_codes() with the source dict.
-    // global_dict_words carries the target table's dict (for validation).
-    // passthrough_source_dict_words carries the source dict (for code mapping),
-    // sorted lexicographically; codes are assigned as index + 1.
-    optional bool is_dict_passthrough = 15;
+    // Dict passthrough: source dict for code mapping, sorted lexicographically;
+    // codes are assigned as index + 1. When non-empty, the column's data contains
+    // INT dict codes (not strings).
     repeated string passthrough_source_dict_words = 16;
 };
 

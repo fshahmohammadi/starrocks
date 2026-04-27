@@ -255,7 +255,6 @@ void NodeChannel::_open(int64_t index_id, RefCountClosure<PTabletWriterOpenResul
                     slot->add_passthrough_source_dict_words(rdict.at(code).to_string());
                 }
             }
-            slot->set_is_dict_passthrough(true);
         }
         auto it_version = dict_version.find(slot->id());
         if (it_version != dict_version.end()) {
