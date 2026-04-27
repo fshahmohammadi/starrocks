@@ -640,25 +640,10 @@ public class InsertPlanner {
                     preOptimizePlanContext.requiredColumns);
         }
 
-        // Read passthrough result: which columns the optimizer kept as dict-encoded.
-        // Result maps stringRefId -> dictRefId.
-        // Build effectiveOutputColumns: same as logicalPlan.getOutputColumn() but with
-        // passthrough columns swapped to their dict refs, so PlanFragmentBuilder can find
-        // them in colRefToExpr (the optimized plan uses dict ref IDs, not the original ones).
-        List<ColumnRefOperator> outputCols = logicalPlan.getOutputColumn();
-        List<ColumnRefOperator> effectiveOutputColumns = new ArrayList<>(outputCols);
-        Map<Integer, Integer> passthroughResult = optimizerContext.getSinkDictPassthroughResult();
-        if (!passthroughResult.isEmpty()) {
-            for (int i = 0; i < outputCols.size() && i < outputFullSchema.size(); i++) {
-                Integer dictRefId = passthroughResult.get(outputCols.get(i).getId());
-                if (dictRefId != null) {
-                    ColumnRefOperator dictRefCol = columnRefFactory.getColumnRef(dictRefId);
-                    passthroughColumnToDictRefSlotId.put(
-                            outputFullSchema.get(i).getName(), dictRefId);
-                    effectiveOutputColumns.set(i, dictRefCol);
-                }
-            }
-        }
+        List<ColumnRefOperator> effectiveOutputColumns = buildEffectiveOutputColumns(
+                optimizerContext.getSinkDictPassthroughResult(),
+                logicalPlan.getOutputColumn(), outputFullSchema,
+                columnRefFactory, passthroughColumnToDictRefSlotId);
 
         //8. Build fragment exec plan
         boolean hasOutputFragment = ((queryRelation instanceof SelectRelation && queryRelation.hasLimit())
@@ -738,6 +723,30 @@ public class InsertPlanner {
         if (lastFragment.getQueryGlobalDictExprs() != null) {
             sinkFragment.mergeQueryDictExprs(lastFragment.getQueryGlobalDictExprs());
         }
+    }
+
+    /**
+     * Read passthrough result from the optimizer and swap passthrough columns to their dict refs
+     * in the output column list. Populates passthroughColumnToDictRefSlotId for slot descriptor setup.
+     */
+    static List<ColumnRefOperator> buildEffectiveOutputColumns(
+            Map<Integer, Integer> passthroughResult,
+            List<ColumnRefOperator> outputColumns,
+            List<Column> schema,
+            ColumnRefFactory columnRefFactory,
+            Map<String, Integer> passthroughColumnToDictRefSlotId) {
+        List<ColumnRefOperator> effectiveOutputColumns = new ArrayList<>(outputColumns);
+        if (!passthroughResult.isEmpty()) {
+            for (int i = 0; i < outputColumns.size() && i < schema.size(); i++) {
+                Integer dictRefId = passthroughResult.get(outputColumns.get(i).getId());
+                if (dictRefId != null) {
+                    ColumnRefOperator dictRefCol = columnRefFactory.getColumnRef(dictRefId);
+                    passthroughColumnToDictRefSlotId.put(schema.get(i).getName(), dictRefId);
+                    effectiveOutputColumns.set(i, dictRefCol);
+                }
+            }
+        }
+        return effectiveOutputColumns;
     }
 
     private PreOptimizePlanContext preparePreOptimizePlanContext(InsertStmt insertStmt,

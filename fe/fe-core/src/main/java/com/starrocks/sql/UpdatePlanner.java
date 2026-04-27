@@ -117,23 +117,12 @@ public class UpdatePlanner {
                     new PhysicalPropertySet(),
                     new ColumnRefSet(outputColumns));
 
-            // Read passthrough result and build effective output columns
             Map<String, Integer> passthroughColumnToDictRefSlotId = new HashMap<>();
             Map<Integer, Integer> passthroughSourceSlotMap = new HashMap<>();
-            List<ColumnRefOperator> effectiveOutputColumns = new ArrayList<>(outputColumns);
-            Map<Integer, Integer> passthroughResult = optimizerContext.getSinkDictPassthroughResult();
-            if (!passthroughResult.isEmpty()) {
-                List<Column> updateSchema = buildUpdatedSchema(targetTable, updateStmt);
-                for (int i = 0; i < outputColumns.size() && i < updateSchema.size(); i++) {
-                    Integer dictRefId = passthroughResult.get(outputColumns.get(i).getId());
-                    if (dictRefId != null) {
-                        ColumnRefOperator dictRefCol = columnRefFactory.getColumnRef(dictRefId);
-                        passthroughColumnToDictRefSlotId.put(
-                                updateSchema.get(i).getName(), dictRefId);
-                        effectiveOutputColumns.set(i, dictRefCol);
-                    }
-                }
-            }
+            List<ColumnRefOperator> effectiveOutputColumns = InsertPlanner.buildEffectiveOutputColumns(
+                    optimizerContext.getSinkDictPassthroughResult(),
+                    outputColumns, buildUpdatedSchema(targetTable, updateStmt),
+                    columnRefFactory, passthroughColumnToDictRefSlotId);
 
             ExecPlan execPlan = PlanFragmentBuilder.createPhysicalPlan(optimizedPlan, session,
                     effectiveOutputColumns, columnRefFactory, colNames, TResultSinkType.MYSQL_PROTOCAL, false);
