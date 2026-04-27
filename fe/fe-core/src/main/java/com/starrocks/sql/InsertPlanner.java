@@ -631,7 +631,7 @@ public class InsertPlanner {
             optimizerContext.setSourceTablesCount(sourceTablesCount);
             // Dict passthrough: tell the optimizer which output columns don't need decode
             List<ColumnRefOperator> passthroughColumns = computeSinkCandidatePassthroughColumns(
-                    targetTable, logicalPlan.getOutputColumn(),
+                    session.getSessionVariable(), targetTable, logicalPlan.getOutputColumn(),
                     outputFullSchema.stream().map(Column::getName).collect(Collectors.toList()));
             optimizerContext.setSinkPassthroughCandidateOutputColumns(passthroughColumns);
             Optimizer optimizer = OptimizerFactory.create(optimizerContext);
@@ -667,7 +667,11 @@ public class InsertPlanner {
      * These are non-key columns on the target OlapTable.
      */
     static List<ColumnRefOperator> computeSinkCandidatePassthroughColumns(
-            Table targetTable, List<ColumnRefOperator> outputColumns, List<String> columnNames) {
+            SessionVariable sessionVariable, Table targetTable,
+            List<ColumnRefOperator> outputColumns, List<String> columnNames) {
+        if (!sessionVariable.isEnableDictPassthroughSink()) {
+            return List.of();
+        }
         if (!(targetTable instanceof OlapTable olapTable)) {
             return List.of();
         }
