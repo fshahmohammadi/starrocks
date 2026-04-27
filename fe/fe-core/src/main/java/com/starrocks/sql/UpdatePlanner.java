@@ -118,6 +118,7 @@ public class UpdatePlanner {
 
             // Read passthrough result and build effective output columns
             Map<String, Integer> passthroughColumnToDictRefSlotId = new HashMap<>();
+            // Dict ref type per column: INT for VARCHAR, ARRAY<INT> for ARRAY<VARCHAR>
             Map<String, Type> passthroughColumnType = new HashMap<>();
             Map<Integer, Integer> passthroughSourceSlotMap = new HashMap<>();
             List<ColumnRefOperator> effectiveOutputColumns = new ArrayList<>(outputColumns);
@@ -125,7 +126,7 @@ public class UpdatePlanner {
             if (!passthroughResult.isEmpty()) {
                 // Build the column schema matching outputColumns order
                 // (for partial update: key columns + assigned columns, in full schema order)
-                List<Column> updateSchema = buildUpdateSchema(targetTable, updateStmt);
+                List<Column> updateSchema = buildUpdatedSchema(targetTable, updateStmt);
                 for (int i = 0; i < outputColumns.size() && i < updateSchema.size(); i++) {
                     Integer dictRefId = passthroughResult.get(outputColumns.get(i).getId());
                     if (dictRefId != null) {
@@ -195,18 +196,8 @@ public class UpdatePlanner {
                 sinkFragment.setSink(dataSink);
                 sinkFragment.setLoadGlobalDicts(globalDicts);
 
-                // Wire up dict passthrough on sink and fragment
-                if (!passthroughSourceSlotMap.isEmpty()) {
-                    ((OlapTableSink) dataSink).setDictPassthroughColumnNames(
-                            new ArrayList<>(passthroughColumnToDictRefSlotId.keySet()));
-                    sinkFragment.setDictPassthroughSourceSlotMap(passthroughSourceSlotMap);
-                    PlanFragment lastFragment = execPlan.getFragments().get(
-                            execPlan.getFragments().size() - 1);
-                    sinkFragment.mergeQueryGlobalDicts(lastFragment.getQueryGlobalDicts());
-                    if (lastFragment.getQueryGlobalDictExprs() != null) {
-                        sinkFragment.mergeQueryDictExprs(lastFragment.getQueryGlobalDictExprs());
-                    }
-                }
+                InsertPlanner.wireDictPassthrough(passthroughSourceSlotMap,
+                        passthroughColumnToDictRefSlotId.keySet(), dataSink, sinkFragment, execPlan);
 
                 // if sink is OlapTableSink Assigned to Be execute this sql [cn execute OlapTableSink will crash]
                 session.getSessionVariable().setPreferComputeNode(false);
@@ -331,7 +322,7 @@ public class UpdatePlanner {
      * Build the column schema in the same order as outputColumns for UPDATE.
      * For partial update: key columns + assigned columns, in full schema order.
      */
-    private List<Column> buildUpdateSchema(Table targetTable, UpdateStmt updateStmt) {
+    private List<Column> buildUpdatedSchema(Table targetTable, UpdateStmt updateStmt) {
         List<Column> result = new ArrayList<>();
         for (Column column : targetTable.getFullSchema()) {
             if (updateStmt.usePartialUpdate() && !column.isGeneratedColumn() &&

@@ -573,19 +573,8 @@ public class InsertPlanner {
             }
             sinkFragment.setSink(dataSink);
             sinkFragment.setLoadGlobalDicts(globalDicts);
-            if (!passthroughSourceSlotMap.isEmpty()) {
-                Preconditions.checkState(dataSink instanceof OlapTableSink);
-                ((OlapTableSink) dataSink).setDictPassthroughColumnNames(
-                        passthroughColumnToDictRefSlotId.keySet());
-                sinkFragment.setDictPassthroughSourceSlotMap(passthroughSourceSlotMap);
-                // Propagate dicts and dict exprs from the last fragment to the sink fragment.
-                PlanFragment lastFragment = execPlan.getFragments().get(
-                        execPlan.getFragments().size() - 1);
-                sinkFragment.mergeQueryGlobalDicts(lastFragment.getQueryGlobalDicts());
-                if (lastFragment.getQueryGlobalDictExprs() != null) {
-                    sinkFragment.mergeQueryDictExprs(lastFragment.getQueryGlobalDictExprs());
-                }
-            }
+            wireDictPassthrough(passthroughSourceSlotMap, passthroughColumnToDictRefSlotId.keySet(),
+                    dataSink, sinkFragment, execPlan);
             return execPlan;
         }
     }
@@ -640,14 +629,13 @@ public class InsertPlanner {
 
         int sourceTablesCount = collectSourceTablesCount(session, insertStmt);
 
-        // Dict passthrough: tell the optimizer which output columns don't need decode
-        List<ColumnRefOperator> passthroughColumns = computeSinkCandidatePassthroughColumns(
-                targetTable, logicalPlan.getOutputColumn());
-
         OptimizerContext optimizerContext;
         try (Timer ignore2 = Tracers.watchScope("Optimizer")) {
             optimizerContext = OptimizerFactory.initContext(session, columnRefFactory);
             optimizerContext.setSourceTablesCount(sourceTablesCount);
+            // Dict passthrough: tell the optimizer which output columns don't need decode
+            List<ColumnRefOperator> passthroughColumns = computeSinkCandidatePassthroughColumns(
+                    targetTable, logicalPlan.getOutputColumn());
             optimizerContext.setSinkPassthroughCandidateOutputColumns(passthroughColumns);
             Optimizer optimizer = OptimizerFactory.create(optimizerContext);
             optimizedPlan = optimizer.optimize(
@@ -704,12 +692,12 @@ public class InsertPlanner {
         if (targetTable.isCloudNativeTableOrMaterializedView()) {
             return List.of();
         }
+        Preconditions.checkState(outputColumns.size() == outputFullSchema.size());
         Set<String> keyColumnNames = getKeyColumnNames(olapTable);
 
         List<ColumnRefOperator> result = new ArrayList<>();
-        for (int i = 0; i < outputColumns.size() && i < outputFullSchema.size(); i++) {
-            String colName = outputFullSchema.get(i).getName().toLowerCase();
-            if (!keyColumnNames.contains(colName)) {
+        for (int i = 0; i < outputFullSchema.size(); i++) {
+            if (!keyColumnNames.contains(outputFullSchema.get(i).getName().toLowerCase())) {
                 result.add(outputColumns.get(i));
             }
         }
@@ -736,6 +724,26 @@ public class InsertPlanner {
                     .collect(Collectors.toList()));
         }
         return keyColumnNames;
+    }
+
+    /**
+     * Wire dict passthrough onto the sink and fragment. Shared by InsertPlanner and UpdatePlanner.
+     */
+    static void wireDictPassthrough(Map<Integer, Integer> passthroughSourceSlotMap,
+                                     Collection<String> passthroughColumnNames,
+                                     DataSink dataSink, PlanFragment sinkFragment, ExecPlan execPlan) {
+        if (passthroughSourceSlotMap.isEmpty()) {
+            return;
+        }
+        Preconditions.checkState(dataSink instanceof OlapTableSink);
+        ((OlapTableSink) dataSink).setDictPassthroughColumnNames(passthroughColumnNames);
+        sinkFragment.setDictPassthroughSourceSlotMap(passthroughSourceSlotMap);
+        // Propagate dicts and dict exprs from the last fragment to the sink fragment.
+        PlanFragment lastFragment = execPlan.getFragments().get(execPlan.getFragments().size() - 1);
+        sinkFragment.mergeQueryGlobalDicts(lastFragment.getQueryGlobalDicts());
+        if (lastFragment.getQueryGlobalDictExprs() != null) {
+            sinkFragment.mergeQueryDictExprs(lastFragment.getQueryGlobalDictExprs());
+        }
     }
 
     private PreOptimizePlanContext preparePreOptimizePlanContext(InsertStmt insertStmt,

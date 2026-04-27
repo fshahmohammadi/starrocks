@@ -104,7 +104,7 @@ public class DecodeRewriter extends OptExpressionVisitor<OptExpression, ColumnRe
     }
 
     public Pair<OptExpression, Map<Integer, Integer>> rewrite(OptExpression optExpression,
-                                                               List<ColumnRefOperator> sinkPassthroughCandidateOutputColumns) {
+                                                               Collection<ColumnRefOperator> sinkPassthroughCandidateOutputColumns) {
         if (context.allStringColumns.isEmpty()) {
             return Pair.create(optExpression, Map.of());
         }
