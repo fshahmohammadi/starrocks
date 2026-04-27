@@ -34,6 +34,8 @@
 
 #pragma once
 
+#include <vector>
+
 #include "fs/fs.h"
 #include "gen_cpp/olap_file.pb.h"
 #include "runtime/global_dict/types_fwd_decl.h"
@@ -81,6 +83,7 @@ public:
     uint32_t max_rows_per_segment = INT32_MAX;
 
     GlobalDictByNameMaps* global_dicts = nullptr;
+    phmap::flat_hash_map<std::string, std::vector<Slice>>* passthrough_source_dicts = nullptr;
 
     RowsetWriterType writer_type = kHorizontal;
 

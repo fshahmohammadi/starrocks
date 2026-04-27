@@ -35,6 +35,7 @@
 #include "storage/rowset/binary_dict_page.h"
 
 #include <memory>
+#include <vector>
 
 #include "common/logging.h"
 #include "gutil/casts.h"
@@ -174,6 +175,63 @@ bool BinaryDictPageBuilder::is_valid_global_dict(const GlobalDictMap* global_dic
         }
     }
     return true;
+}
+
+uint32_t BinaryDictPageBuilder::add_codes(const int32_t* codes, uint32_t count,
+                                           const std::vector<Slice>& source_dict) {
+    if (_encoding_type == PLAIN_ENCODING) {
+        // Dict page full — resolve codes to strings and write as plain.
+        // Null-position codes may be garbage; use empty Slice as placeholder.
+        std::vector<Slice> slices(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            int32_t code = codes[i];
+            DCHECK(code >= 0 && code < source_dict.size());
+            slices[i] = source_dict[code];
+        }
+        return _data_page_builder->add(reinterpret_cast<const uint8_t*>(slices.data()), count);
+    }
+
+    DCHECK(!_finished);
+    DCHECK_GT(count, 0);
+    auto* code_page = down_cast<BitshufflePageBuilder<TYPE_INT>*>(_data_page_builder.get());
+
+    if (_data_page_builder->count() == 0) {
+        int32_t code = codes[0];
+        DCHECK(code >= 0 && code < source_dict.size());
+        const Slice& s = source_dict[code];
+        _first_value.assign_copy(reinterpret_cast<const uint8_t*>(s.data), s.size);
+    }
+
+    for (uint32_t i = 0; i < count; ++i) {
+        int32_t source_code = codes[i];
+        uint32_t local_code;
+
+        auto it = _code_mapping.find(source_code);
+        if (it != _code_mapping.end()) {
+            local_code = it->second;
+        } else {
+            // First time seeing this source code — resolve string and map to local dict.
+            DCHECK(source_code >= 0 && source_code < source_dict.size());
+            Slice s = source_dict[source_code];
+            auto dict_it = _dictionary.find(s);
+            if (dict_it != _dictionary.end()) {
+                // String already in local dict (e.g., different source codes mapping to same string).
+                local_code = dict_it->second;
+            } else {
+                if (!_dict_builder->add_slice(s)) {
+                    return i; // dict page full
+                }
+                local_code = _dictionary.size();
+                _dictionary.emplace(std::string(s.data, s.size), local_code);
+            }
+            _code_mapping[source_code] = local_code;
+        }
+
+        if (code_page->add_one(reinterpret_cast<const uint8_t*>(&local_code)) < 1) {
+            return i;
+        }
+    }
+    return count;
 }
 
 template <LogicalType Type>

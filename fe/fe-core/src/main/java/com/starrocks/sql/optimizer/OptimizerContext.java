@@ -25,6 +25,7 @@ import com.starrocks.sql.common.ErrorType;
 import com.starrocks.sql.common.StarRocksPlannerException;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
 import com.starrocks.sql.optimizer.dump.DumpInfo;
+import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.IsNullPredicateOperator;
 import com.starrocks.sql.optimizer.rule.RuleSet;
 import com.starrocks.sql.optimizer.rule.RuleType;
@@ -78,6 +79,14 @@ public class OptimizerContext {
     // Is not null predicate can be derived from inner join or semi join,
     // which should be kept to be used to convert outer join into inner join.
     private final List<IsNullPredicateOperator> pushdownNotNullPredicates = Lists.newArrayList();
+
+    // Dict passthrough for INSERT INTO...SELECT: output columns that are safe to keep
+    // dict-encoded because they go directly to an OlapTableSink.
+    // Set by InsertPlanner before optimization; read by DecodeRewriter.
+    private List<ColumnRefOperator> sinkPassthroughCandidateOutputColumns = List.of();
+    // Result: maps stringRefId -> dictRefId for columns that were actually kept as dict-encoded.
+    // Set by LowCardinalityRewriteRule after DecodeRewriter; read by InsertPlanner.
+    private Map<Integer, Integer> sinkDictPassthroughResult = Map.of();
 
     OptimizerContext(ConnectContext context) {
         this.connectContext = context;
@@ -270,6 +279,22 @@ public class OptimizerContext {
 
     public Stopwatch getOptimizerTimer() {
         return optimizerTimer;
+    }
+
+    public List<ColumnRefOperator> getSinkPassthroughOutputColumns() {
+        return sinkPassthroughCandidateOutputColumns;
+    }
+
+    public void setSinkPassthroughOutputColumns(List<ColumnRefOperator> columns) {
+        this.sinkPassthroughCandidateOutputColumns = columns;
+    }
+
+    public Map<Integer, Integer> getSinkDictPassthroughResult() {
+        return sinkDictPassthroughResult;
+    }
+
+    public void setSinkDictPassthroughResult(Map<Integer, Integer> result) {
+        this.sinkDictPassthroughResult = result;
     }
 
     /**

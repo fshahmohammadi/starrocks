@@ -102,6 +102,7 @@ DeltaWriterOptions LocalTabletsChannel::_build_delta_writer_options(const PTable
     options.load_id = params.id();
     options.slots = index_slots;
     options.global_dicts = &_global_dicts;
+    options.passthrough_source_dicts = &_passthrough_source_dicts;
     options.parent_span = _load_channel->get_span();
     options.index_id = _index_id;
     options.node_id = _node_id;
@@ -741,22 +742,36 @@ Status LocalTabletsChannel::_open_all_writers(const PTabletWriterOpenRequest& pa
     if (index_slots == nullptr) {
         return Status::InvalidArgument(fmt::format("Unknown index_id: {}", _key.to_string()));
     }
+    // Helper: allocate a Slice from _mem_pool for a given string.
+    auto alloc_slice = [this](const std::string& word) -> StatusOr<Slice> {
+        auto* data = _mem_pool->allocate(word.size());
+        RETURN_IF_UNLIKELY_NULL(data, Status::MemoryAllocFailed("alloc mem for global dict failed"));
+        memcpy(data, word.data(), word.size());
+        return Slice(data, word.size());
+    };
     // init global dict info if needed
     for (auto& slot : params.schema().slot_descs()) {
         GlobalDictMap global_dict;
         if (slot.global_dict_words_size()) {
             for (size_t i = 0; i < slot.global_dict_words_size(); i++) {
-                const std::string& dict_word = slot.global_dict_words(i);
-                auto* data = _mem_pool->allocate(dict_word.size());
-                RETURN_IF_UNLIKELY_NULL(data, Status::MemoryAllocFailed("alloc mem for global dict failed"));
-                memcpy(data, dict_word.data(), dict_word.size());
-                Slice slice(data, dict_word.size());
+                ASSIGN_OR_RETURN(auto slice, alloc_slice(slot.global_dict_words(i)));
                 global_dict.emplace(slice, i);
             }
             GlobalDictsWithVersion<GlobalDictMap> dict;
             dict.dict = std::move(global_dict);
             dict.version = slot.has_global_dict_version() ? slot.global_dict_version() : 0;
             _global_dicts.emplace(std::make_pair(slot.col_name(), std::move(dict)));
+        }
+        // Build passthrough source dict (1-based: index 0 is unused placeholder)
+        if (slot.passthrough_source_dict_words_size() > 0) {
+            std::vector<Slice> source_dict;
+            source_dict.reserve(slot.passthrough_source_dict_words_size() + 1);
+            source_dict.emplace_back(); // index 0 unused
+            for (size_t i = 0; i < slot.passthrough_source_dict_words_size(); i++) {
+                ASSIGN_OR_RETURN(auto slice, alloc_slice(slot.passthrough_source_dict_words(i)));
+                source_dict.push_back(slice);
+            }
+            _passthrough_source_dicts.emplace(slot.col_name(), std::move(source_dict));
         }
     }
 

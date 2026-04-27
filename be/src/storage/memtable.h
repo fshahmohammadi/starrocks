@@ -16,9 +16,11 @@
 
 #include <atomic>
 #include <ostream>
+#include <unordered_map>
 
 #include "column/chunk.h"
 #include "exec/sorting/sort_permute.h"
+#include "runtime/global_dict/types_fwd_decl.h"
 #include "gen_cpp/data.pb.h"
 #include "gen_cpp/olap_file.pb.h"
 #include "storage/chunk_aggregator.h"
@@ -105,8 +107,14 @@ public:
 
     void set_write_buffer_row(size_t max_buffer_row) { _max_buffer_row = max_buffer_row; }
 
-    static Schema convert_schema(const TabletSchemaCSPtr& tablet_schema,
-                                 const std::vector<SlotDescriptor*>* slot_descs);
+    // Set passthrough reverse dicts for dict-passthrough columns.
+    // Maps slot index -> 1-based source dict vector (index 0 unused).
+    void set_dict_passthrough_reverse_dicts(
+            const phmap::flat_hash_map<std::string, std::vector<Slice>>* passthrough_source_dicts);
+
+    static Schema convert_schema(
+            const TabletSchemaCSPtr& tablet_schema, const std::vector<SlotDescriptor*>* slot_descs,
+            const phmap::flat_hash_map<std::string, std::vector<Slice>>* passthrough_source_dicts = nullptr);
 
     ChunkPtr get_result_chunk() { return _result_chunk; }
 
@@ -168,6 +176,9 @@ private:
     size_t _aggregator_bytes_usage = 0;
 
     MemtableStats _stats;
+
+    // Dict-passthrough: slot_index -> 1-based source dict vector for decoding INT codes to strings.
+    std::unordered_map<int, std::vector<Slice>> _passthrough_reverse_dicts;
 };
 
 inline std::ostream& operator<<(std::ostream& os, const MemTable& table) {

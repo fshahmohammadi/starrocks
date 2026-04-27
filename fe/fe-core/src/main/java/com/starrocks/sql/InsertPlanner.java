@@ -81,6 +81,7 @@ import com.starrocks.sql.common.StarRocksPlannerException;
 import com.starrocks.sql.common.TypeManager;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.Optimizer;
+import com.starrocks.sql.optimizer.OptimizerContext;
 import com.starrocks.sql.optimizer.OptimizerFactory;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
@@ -143,6 +144,12 @@ public class InsertPlanner {
 
     private List<Column> outputBaseSchema;
     private List<Column> outputFullSchema;
+
+    // Dict passthrough: maps column name -> dictRef slot ID (the INT column's slot in the scan tuple).
+    // Columns in this map skip decode and pass INT codes directly to the sink.
+    // Used to build the sink slot ID -> dictRef slot ID mapping for query_global_dicts lookup.
+    private Map<String, Integer> passthroughColumnToDictRefSlotId = new HashMap<>();
+    private Map<String, Type> passthroughColumnType = new HashMap<>();
 
     private static final Logger LOG = LogManager.getLogger(InsertPlanner.class);
 
@@ -357,13 +364,29 @@ public class InsertPlanner {
             TupleDescriptor tupleDesc = descriptorTable.createTupleDescriptor();
 
             List<Pair<Integer, ColumnDict>> globalDicts = Lists.newArrayList();
+            Map<Integer, Integer> passthroughSourceSlotMap = Maps.newHashMap();
             long tableId = targetTable.getId();
             for (Column column : outputFullSchema) {
                 SlotDescriptor slotDescriptor = descriptorTable.addSlotDescriptor(tupleDesc);
                 slotDescriptor.setIsMaterialized(true);
-                slotDescriptor.setType(column.getType());
                 slotDescriptor.setColumn(column);
                 slotDescriptor.setIsNullable(column.isAllowNull());
+                Integer dictRefSlotId = passthroughColumnToDictRefSlotId.get(column.getName());
+                if (dictRefSlotId != null) {
+                    // Passthrough column: set slot type to the dict ref's type instead of the original.
+                    // For scalar VARCHAR → INT; for ARRAY<VARCHAR> → ARRAY<INT>.
+                    // BE handles both: memtable.convert_schema changes the sub-field type for arrays,
+                    // and array_column_writer propagates the source dict to its element writer
+                    // which reverse-maps INT codes back to VARCHAR strings when writing pages.
+                    // Must set originType too because SlotDescriptor.toThrift() uses originType
+                    // when it's non-null (which setColumn() always sets).
+                    Type dictType = passthroughColumnType.get(column.getName());
+                    slotDescriptor.setType(dictType);
+                    slotDescriptor.setOriginType(dictType);
+                    passthroughSourceSlotMap.put(slotDescriptor.getId().asInt(), dictRefSlotId);
+                } else {
+                    slotDescriptor.setType(column.getType());
+                }
                 if (column.getType().isVarchar() &&
                         IDictManager.getInstance().hasGlobalDict(tableId, column.getColumnId())) {
                     Optional<ColumnDict> dict = IDictManager.getInstance().getGlobalDict(tableId, column.getColumnId());
@@ -515,6 +538,20 @@ public class InsertPlanner {
             }
             sinkFragment.setSink(dataSink);
             sinkFragment.setLoadGlobalDicts(globalDicts);
+            if (!passthroughSourceSlotMap.isEmpty()) {
+                Preconditions.checkState(dataSink instanceof OlapTableSink,
+                        "Dict passthrough requires OlapTableSink");
+                ((OlapTableSink) dataSink).setDictPassthroughColumnNames(
+                        new ArrayList<>(passthroughColumnToDictRefSlotId.keySet()));
+                sinkFragment.setDictPassthroughSourceSlotMap(passthroughSourceSlotMap);
+                // Propagate dicts and dict exprs from the last fragment to the sink fragment.
+                PlanFragment lastFragment = execPlan.getFragments().get(
+                        execPlan.getFragments().size() - 1);
+                sinkFragment.mergeQueryGlobalDicts(lastFragment.getQueryGlobalDicts());
+                if (lastFragment.getQueryGlobalDictExprs() != null) {
+                    sinkFragment.mergeQueryDictExprs(lastFragment.getQueryGlobalDictExprs());
+                }
+            }
             return execPlan;
         }
     }
@@ -564,12 +601,40 @@ public class InsertPlanner {
                 session.getSessionVariable());
         OptExpression optimizedPlan;
 
+        // Dict passthrough: tell the optimizer which output columns don't need decode
+        List<ColumnRefOperator> passthroughColumns = computeSinkCandidatePassthroughColumns(
+                targetTable, logicalPlan.getOutputColumn());
+        OptimizerContext optimizerContext;
         try (Timer ignore2 = Tracers.watchScope("Optimizer")) {
-            Optimizer optimizer = OptimizerFactory.create(OptimizerFactory.initContext(session, columnRefFactory));
+            optimizerContext = OptimizerFactory.initContext(session, columnRefFactory);
+            optimizerContext.setSinkPassthroughCandidateOutputColumns(passthroughColumns);
+            Optimizer optimizer = OptimizerFactory.create(optimizerContext);
             optimizedPlan = optimizer.optimize(
                     logicalPlan.getRoot(),
                     requiredPropertySet,
                     new ColumnRefSet(logicalPlan.getOutputColumn()));
+        }
+
+        // Read passthrough result: which columns the optimizer kept as dict-encoded.
+        // Result maps stringRefId -> dictRefId.
+        // Build effectiveOutputColumns: same as logicalPlan.getOutputColumn() but with
+        // passthrough columns swapped to their dict refs, so PlanFragmentBuilder can find
+        // them in colRefToExpr (the optimized plan uses dict ref IDs, not the original ones).
+        List<ColumnRefOperator> outputCols = logicalPlan.getOutputColumn();
+        List<ColumnRefOperator> effectiveOutputColumns = new ArrayList<>(outputCols);
+        Map<Integer, Integer> passthroughResult = optimizerContext.getSinkDictPassthroughResult();
+        if (!passthroughResult.isEmpty()) {
+            for (int i = 0; i < outputCols.size() && i < outputFullSchema.size(); i++) {
+                Integer dictRefId = passthroughResult.get(outputCols.get(i).getId());
+                if (dictRefId != null) {
+                    ColumnRefOperator dictRefCol = columnRefFactory.getColumnRef(dictRefId);
+                    passthroughColumnToDictRefSlotId.put(
+                            outputFullSchema.get(i).getName(), dictRefId);
+                    passthroughColumnType.put(
+                            outputFullSchema.get(i).getName(), dictRefCol.getType());
+                    effectiveOutputColumns.set(i, dictRefCol);
+                }
+            }
         }
 
         //8. Build fragment exec plan
@@ -578,10 +643,58 @@ public class InsertPlanner {
         ExecPlan execPlan;
         try (Timer ignore3 = Tracers.watchScope("PlanBuilder")) {
             execPlan = PlanFragmentBuilder.createPhysicalPlan(
-                    optimizedPlan, session, logicalPlan.getOutputColumn(), columnRefFactory,
+                    optimizedPlan, session, effectiveOutputColumns, columnRefFactory,
                     queryRelation.getColumnOutputNames(), TResultSinkType.MYSQL_PROTOCAL, hasOutputFragment);
         }
         return execPlan;
+    }
+
+    /**
+     * Compute candidate output columns that may be kept dict-encoded for sink passthrough.
+     * Returns the ColumnRefOperators for non-key columns on the target OlapTable.
+     */
+    private List<ColumnRefOperator> computeSinkCandidatePassthroughColumns(Table targetTable,
+                                                                   List<ColumnRefOperator> outputColumns) {
+        if (!(targetTable instanceof OlapTable)) {
+            return List.of();
+        }
+        // Dict passthrough is not supported in shared-data (lake/cloud-native) mode
+        // because the lake DeltaWriter does not support passthrough_source_dicts.
+        if (targetTable.isCloudNativeTableOrMaterializedView()) {
+            return List.of();
+        }
+        Set<String> keyColumnNames = getKeyColumnNames((OlapTable) targetTable);
+
+        List<ColumnRefOperator> result = new ArrayList<>();
+        for (int i = 0; i < outputColumns.size() && i < outputFullSchema.size(); i++) {
+            String colName = outputFullSchema.get(i).getName().toLowerCase();
+            if (!keyColumnNames.contains(colName)) {
+                result.add(outputColumns.get(i));
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Returns the set of key/partition/distribution/sort column names (lowercased)
+     * for an OlapTable. Used to identify columns that must NOT be passthrough candidates.
+     */
+    static Set<String> getKeyColumnNames(OlapTable olapTable) {
+        Set<String> keyColumnNames = new HashSet<>();
+        keyColumnNames.addAll(olapTable.getPartitionColumnNames().stream()
+                .map(String::toLowerCase).collect(Collectors.toList()));
+        keyColumnNames.addAll(olapTable.getDistributionColumnNames());
+        keyColumnNames.addAll(olapTable.getKeyColumns().stream()
+                .map(c -> c.getName().toLowerCase()).collect(Collectors.toList()));
+        MaterializedIndexMeta indexMeta = olapTable.getIndexMetaByIndexId(olapTable.getBaseIndexId());
+        if (indexMeta != null && indexMeta.getSortKeyIdxes() != null) {
+            List<Column> schema = indexMeta.getSchema();
+            keyColumnNames.addAll(indexMeta.getSortKeyIdxes().stream()
+                    .filter(idx -> idx < schema.size())
+                    .map(idx -> schema.get(idx).getName().toLowerCase())
+                    .collect(Collectors.toList()));
+        }
+        return keyColumnNames;
     }
 
     private void castLiteralToTargetColumnsType(InsertStmt insertStatement) {
