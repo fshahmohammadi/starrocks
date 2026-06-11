@@ -298,6 +298,20 @@ class DecodeContext {
         return ExprUtils.getBuiltinFunction(fnName, argTypes, Function.CompareMode.IS_SUPERTYPE_OF);
     }
 
+    // Build dict_encode(value, dict_slot_id): translate a constant `value` (VARCHAR or ARRAY<VARCHAR>)
+    // to its global-dictionary code(s) for the dict-encoded column that backs `stringRef`, so a
+    // dict-aware comparison can run on integer codes (e.g. array_contains(dict_col, dict_encode('foo',
+    // slot))). The dict slot id is the id of stringRef's dict-encoded column ref (its dict id equals
+    // the slot id). The encoding happens once on the BE (DictFunctions::dict_encode).
+    ScalarOperator encodeConstant(ConstantOperator value, ScalarOperator stringRef) {
+        ColumnRefOperator dictRef = stringRefToDictRefMap.get(stringRef);
+        Preconditions.checkNotNull(dictRef, "no dict-encoded column ref for string ref %s", stringRef);
+        List<ScalarOperator> args =
+                Lists.<ScalarOperator>newArrayList(value, ConstantOperator.createInt(dictRef.getId()));
+        Function fn = buildFunction(FunctionSet.DICT_ENCODE, args);
+        return new CallOperator(FunctionSet.DICT_ENCODE, getDictifiedType(value.getType()), args, fn);
+    }
+
     // define mode: means the result column is dict, DictExpr should return int/array<int> type
     // decode mode: means the result column is string, DictExpr should return string/array<string> type
     private class DictExprRewrite extends BaseScalarOperatorShuttle {
