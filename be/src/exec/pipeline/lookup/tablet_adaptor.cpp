@@ -21,6 +21,7 @@
 #include "base/status_fmt.hpp"
 #include "base/statusor.h"
 #include "compute_env/global_dict/fragment_dict_state.h"
+#include "compute_env/global_dict/parser.h"
 #include "exec/exec_env.h"
 #include "exec/olap_scan_node.h"
 #include "exec/pipeline/fragment_context.h"
@@ -66,7 +67,7 @@ Status init_global_dicts_for_scan_node(RuntimeState* state, ObjectPool* pool, co
                                        ColumnIdToGlobalDictMap** global_dicts) {
     const auto* fragment_dict_state = state->fragment_dict_state();
     DCHECK(fragment_dict_state != nullptr);
-    const auto& global_dict_map = fragment_dict_state->query_global_dicts();
+    auto* dict_optimize_parser = fragment_dict_state->dict_optimize_parser();
 
     auto dicts = pool->add(new ColumnIdToGlobalDictMap());
     for (auto* slot : slots) {
@@ -74,10 +75,8 @@ Status init_global_dicts_for_scan_node(RuntimeState* state, ObjectPool* pool, co
         if (index < 0) {
             return Status::InternalError(fmt::format("invalid field name: {}", slot->col_name()));
         }
-        auto iter = global_dict_map.find(slot->id());
-        if (iter != global_dict_map.end()) {
-            auto& dict_map = iter->second.first;
-            dicts->emplace(index, const_cast<GlobalDictMap*>(&dict_map));
+        if (const GlobalDictMap* dict_map = dict_optimize_parser->get_dict_map(slot->id()); dict_map != nullptr) {
+            dicts->emplace(index, dict_map);
         }
     }
     *global_dicts = dicts;
