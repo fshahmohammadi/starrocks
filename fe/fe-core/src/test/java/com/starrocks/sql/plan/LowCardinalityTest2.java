@@ -3267,4 +3267,27 @@ public class LowCardinalityTest2 extends PlanTestBase {
             connectContext.getGlobalStateMgr().setStatisticStorage(prevStorage);
         }
     }
+
+    @Test
+    void testUnionAllConstantInputsOnly() throws Exception {
+        String sql = """
+                select c_user, "abc", null const FROM low_card_t1 as s
+                UNION ALL
+                select c_mr, null, null FROM low_card_t2;
+                """;
+        String plan = getVerboseExplain(sql);
+        assertContains(plan, "9:Decode\n" +
+                "  |  <dict id 28> : <string id 24>\n" +
+                "  |  <dict id 30> : <string id 23>\n" +
+                "  |  cardinality: 2\n" +
+                "  |  \n" +
+                "  0:UNION\n" +
+                "  |  output exprs:\n" +
+                "  |      [30, INT, true] | [28, INT, true] | [25, BOOLEAN, true]\n" +
+                "  |  child exprs:\n" +
+                "  |      [26: c_user, INT, true] | [31: expr, INT, false] | [13: expr, BOOLEAN, true]\n" +
+                "  |      [29: cast, INT, true] | [32: expr, INT, true] | [20: expr, BOOLEAN, true]", plan);
+        String thrift = getThriftPlan(sql);
+        Assertions.assertTrue(thrift.contains("TGlobalDict(columnId:28"), thrift);
+    }
 }
