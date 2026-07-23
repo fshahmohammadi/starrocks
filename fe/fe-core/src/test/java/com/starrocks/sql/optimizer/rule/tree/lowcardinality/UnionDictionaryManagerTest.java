@@ -275,14 +275,58 @@ class UnionDictionaryManagerTest {
         stringRefToDefineExprMap.put(4, col1);
         stringRefToDefineExprMap.put(5, col2);
         stringRefToDefineExprMap.put(6, col3);
-        List<Map<ColumnRefOperator, ConstantOperator>> constantEncodingMap =
+        List<List<ConstantOperator>> constantEncodingMap =
                 unionDictionaryManager.generateConstantEncodingMap(List.of(col4, col5, col6),
                         List.of(List.of(col1, col8, col3), List.of(col7, col2, col9)),
                         new ColumnRefSet(List.of(col1, col2, col4, col5)));
 
         Assertions.assertEquals(2, constantEncodingMap.size());
-        Assertions.assertEquals(Map.of(col8, ConstantOperator.createInt(3)), constantEncodingMap.get(0));
-        Assertions.assertEquals(Map.of(col7, ConstantOperator.createInt(2)), constantEncodingMap.get(1));
+        // Indexed by output position (col4, col5, col6). Branch 0: col8 at position 1 -> code 3.
+        Assertions.assertEquals(Arrays.asList(null, ConstantOperator.createInt(3), null), constantEncodingMap.get(0));
+        // Branch 1: col7 at position 0 -> code 2.
+        Assertions.assertEquals(Arrays.asList(ConstantOperator.createInt(2), null, null), constantEncodingMap.get(1));
+    }
+
+    @Test
+    void testReusedConstantRefAcrossDictionaries() {
+        // A single constant column ref feeds two union output columns that dictify into different
+        // dictionaries. The constant 'd' must encode to a different code per output, and the two
+        // positions must not collapse onto one shared encoded ref. Regression test for the code clash.
+        ColumnRefOperator colA = new ColumnRefOperator(20, StringType.STRING, "colA", true);
+        ColumnRefOperator colB = new ColumnRefOperator(21, StringType.STRING, "colB", true);
+        ColumnRefOperator sharedConst = new ColumnRefOperator(30, StringType.STRING, "x", true);
+        ColumnRefOperator realE = new ColumnRefOperator(10, StringType.STRING, "realE", true);
+        ColumnRefOperator realA = new ColumnRefOperator(11, StringType.STRING, "realA", true);
+
+        Map<Integer, ColumnDict> globalDicts = new HashMap<>(Map.of(
+                10, makeDict(List.of("e")),
+                11, makeDict(List.of("a"))));
+        Map<Integer, ScalarOperator> stringRefToDefineExprMap = Maps.newHashMap();
+        UnionDictionaryManager unionDictionaryManager =
+                new UnionDictionaryManager(SESSION_VARIABLE, stringRefToDefineExprMap, globalDicts, Set.of());
+        unionDictionaryManager.recordIfConstant(sharedConst, ConstantOperator.createVarchar("d"));
+        Assertions.assertTrue(unionDictionaryManager.isSupportedConstant(sharedConst));
+
+        // colA merges 'd' with {e} -> {d, e};  colB merges 'd' with {a} -> {a, d}
+        Assertions.assertEquals(10, unionDictionaryManager.mergeDictionaries(List.of(30, 10)));
+        Assertions.assertEquals(11, unionDictionaryManager.mergeDictionaries(List.of(30, 11)));
+        unionDictionaryManager.finalizeColumnDictionaries();
+        Assertions.assertEquals(getDictValues(globalDicts.get(10)), List.of("d", "e"));
+        Assertions.assertEquals(getDictValues(globalDicts.get(11)), List.of("a", "d"));
+
+        stringRefToDefineExprMap.put(20, realE);
+        stringRefToDefineExprMap.put(21, realA);
+
+        List<List<ConstantOperator>> constantEncodingMap =
+                unionDictionaryManager.generateConstantEncodingMap(List.of(colA, colB),
+                        List.of(List.of(sharedConst, sharedConst), List.of(realE, realA)),
+                        new ColumnRefSet(List.of(colA, colB, realE, realA)));
+
+        Assertions.assertEquals(2, constantEncodingMap.size());
+        // Branch 0 reuses the same ref at both positions: 'd' is code 1 in {d,e} and code 2 in {a,d}.
+        Assertions.assertEquals(Arrays.asList(ConstantOperator.createInt(1), ConstantOperator.createInt(2)),
+                constantEncodingMap.get(0));
+        Assertions.assertEquals(Arrays.asList(null, null), constantEncodingMap.get(1));
     }
 
     @Test
