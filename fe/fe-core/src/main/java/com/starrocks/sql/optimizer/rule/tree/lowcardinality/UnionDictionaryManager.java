@@ -31,6 +31,7 @@ import com.starrocks.sql.optimizer.statistics.ColumnDict;
 import com.starrocks.type.IntegerType;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -180,11 +181,21 @@ public class UnionDictionaryManager {
         return ConstantOperator.createInt(index);
     }
 
-    List<Map<ColumnRefOperator, ConstantOperator>> generateConstantEncodingMap(List<ColumnRefOperator> outputColumns,
-                                                                               List<List<ColumnRefOperator>> childColumns,
-                                                                               ColumnRefSet allStringColumns) {
-        List<Map<ColumnRefOperator, ConstantOperator>> result = Lists.newArrayList();
-        childColumns.forEach(c -> result.add(Maps.newHashMap()));
+    // For each branch, the encoded constant per output position (null when that position is not a
+    // constant-encoded dict column). Indexed by output position, not by child column ref: one constant
+    // child ref can feed several output columns that dictify into different dictionaries, so the same
+    // ref needs a different code per position and must not collapse onto a single map entry.
+    List<List<ConstantOperator>> generateConstantEncodingMap(List<ColumnRefOperator> outputColumns,
+                                                             List<List<ColumnRefOperator>> childColumns,
+                                                             ColumnRefSet allStringColumns) {
+        List<List<ConstantOperator>> result = Lists.newArrayList();
+        for (int j = 0; j < childColumns.size(); ++j) {
+            List<ConstantOperator> perPosition = new ArrayList<>();
+            for (int i = 0; i < outputColumns.size(); ++i) {
+                perPosition.add(null);
+            }
+            result.add(perPosition);
+        }
         for (int i = 0; i < outputColumns.size(); ++i) {
             if (!allStringColumns.contains(outputColumns.get(i).getId())) {
                 continue;
@@ -197,12 +208,11 @@ public class UnionDictionaryManager {
             for (int j = 0; j < childColumns.size(); ++j) {
                 ColumnRefOperator c = childColumns.get(j).get(i);
                 if (constantColumns.containsKey(c.getId())) {
-                    result.get(j).put(c, generateConstantOperator(c, dictData));
+                    result.get(j).set(i, generateConstantOperator(c, dictData));
                 }
             }
         }
         return result;
-
     }
 
     boolean isSupportedConstant(ColumnRefOperator c) {

@@ -65,7 +65,7 @@ import com.starrocks.type.Type;
 import org.apache.commons.collections4.CollectionUtils;
 import org.jetbrains.annotations.NotNull;
 
-import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -296,29 +296,39 @@ public class DecodeRewriter extends OptExpressionVisitor<OptExpression, ColumnRe
         final DecodeInfo finalInfo = info;
         encodedUnionColumns.union(unionOp.getOutputColumnRefOp().stream().filter(
                 c -> finalInfo.outputStringColumns.contains(c) || finalInfo.usedStringColumns.contains(c)).toList());
-        List<Map<ColumnRefOperator, ConstantOperator>> constantMappings =
+        List<List<ConstantOperator>> constantMappings =
                 context.unionDictionaryManager.generateConstantEncodingMap(
                         unionOp.getOutputColumnRefOp(), unionOp.getChildOutputColumns(), encodedUnionColumns);
         List<List<ColumnRefOperator>> newChildOutputColumns = Lists.newArrayList();
         for (int i = 0; i < optExpression.arity(); ++i) {
-            Map<ColumnRefOperator, ConstantOperator> constantMapping = constantMappings.get(i);
-            HashMap<ColumnRefOperator, ColumnRefOperator> columnMapping = Maps.newHashMap();
-            constantMapping.forEach((key, value) ->
-                    columnMapping.put(key, factory.create(value, value.getType(), value.isNullable())));
-            unionOp.getChildOutputColumns().get(i).forEach(c -> columnMapping.putIfAbsent(c,
-                    finalInfo.inputStringColumns.contains(c.getId()) ?
-                            context.stringRefToDictRefMap.getOrDefault(c, c) : c)
-            );
-            newChildOutputColumns.add(unionOp.getChildOutputColumns().get(i).stream().map(columnMapping::get).toList());
-            if (constantMapping.isEmpty()) {
+            List<ConstantOperator> positionCodes = constantMappings.get(i);
+            List<ColumnRefOperator> childColumns = unionOp.getChildOutputColumns().get(i);
+            List<ColumnRefOperator> newChildColumns = new ArrayList<>(childColumns.size());
+            Map<ColumnRefOperator, ScalarOperator> projections = Maps.newHashMap();
+            boolean hasConstant = false;
+            for (int pos = 0; pos < childColumns.size(); ++pos) {
+                ColumnRefOperator c = childColumns.get(pos);
+                ConstantOperator code = positionCodes.get(pos);
+                if (code != null) {
+                    // Mint a fresh encoded column per output position. A constant child ref reused across
+                    // outputs that dictify into different dictionaries needs a distinct code per position,
+                    // so it must not collapse onto a single shared ref.
+                    ColumnRefOperator encoded = factory.create(code, code.getType(), code.isNullable());
+                    newChildColumns.add(encoded);
+                    projections.put(encoded, code);
+                    hasConstant = true;
+                } else {
+                    ColumnRefOperator encoded = finalInfo.inputStringColumns.contains(c.getId()) ?
+                            context.stringRefToDictRefMap.getOrDefault(c, c) : c;
+                    newChildColumns.add(encoded);
+                    projections.put(encoded, encoded);
+                }
+            }
+            newChildOutputColumns.add(newChildColumns);
+            if (!hasConstant) {
                 continue;
             }
-            PhysicalProjectOperator projectOp = new PhysicalProjectOperator(
-                    unionOp.getChildOutputColumns().get(i).stream().distinct().collect(Collectors.toMap(
-                            columnMapping::get,
-                            c -> constantMapping.containsKey(c) ? constantMapping.get(c) : columnMapping.get(c))),
-                    Map.of()
-            );
+            PhysicalProjectOperator projectOp = new PhysicalProjectOperator(projections, Map.of());
             LogicalProperty property = new LogicalProperty(optExpression.getInputs().get(i).getLogicalProperty());
             property.setOutputColumns(new ColumnRefSet(projectOp.getOutputColumns()));
             OptExpression newChild = OptExpression.builder().with(optExpression.getInputs().get(i)).setOp(projectOp)
