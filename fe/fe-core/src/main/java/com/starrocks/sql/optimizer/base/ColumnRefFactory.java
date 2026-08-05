@@ -54,7 +54,7 @@ public class ColumnRefFactory {
     // resolves to the same ColumnRefOperator id. Lifetime matches this factory: a re-plan creates a
     // fresh factory and thus a fresh cache, which prevents stale ids from leaking across plans
     // (see issue #72831 / PR #72832).
-    private final Map<LambdaArgument, ColumnRefOperator> lambdaArgRefs = new IdentityHashMap<>();
+    private Map<LambdaArgument, ColumnRefOperator> lambdaArgRefs = new IdentityHashMap<>();
 
     // introduced to used to get unique id for query,
     // now used to identify nondeterministic function.
@@ -173,5 +173,20 @@ public class ColumnRefFactory {
     public ColumnRefOperator computeLambdaArgRefIfAbsent(LambdaArgument arg,
                                                          Function<LambdaArgument, ColumnRefOperator> creator) {
         return lambdaArgRefs.computeIfAbsent(arg, creator);
+    }
+
+    // Enter an isolated lambda-argument scope, returning the previous one to restore later.
+    // The same AST can be transformed more than once (an inlined CTE body re-transformed per
+    // consumer). Those instantiations share the same LambdaArgument nodes, so without a fresh
+    // scope they collapse to one lambda-arg id across copies while every other column gets a
+    // fresh id -- which then collides in id-keyed machinery (e.g. array_map global-dict columns).
+    public Map<LambdaArgument, ColumnRefOperator> pushLambdaArgScope() {
+        Map<LambdaArgument, ColumnRefOperator> prev = lambdaArgRefs;
+        lambdaArgRefs = new IdentityHashMap<>();
+        return prev;
+    }
+
+    public void popLambdaArgScope(Map<LambdaArgument, ColumnRefOperator> prev) {
+        lambdaArgRefs = prev;
     }
 }
