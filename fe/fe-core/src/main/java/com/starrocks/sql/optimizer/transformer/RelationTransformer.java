@@ -78,6 +78,7 @@ import com.starrocks.sql.ast.expression.ExprToSql;
 import com.starrocks.sql.ast.expression.ExprUtils;
 import com.starrocks.sql.ast.expression.FunctionCallExpr;
 import com.starrocks.sql.ast.expression.InPredicate;
+import com.starrocks.sql.ast.expression.LambdaArgument;
 import com.starrocks.sql.ast.expression.LimitElement;
 import com.starrocks.sql.ast.expression.SlotRef;
 import com.starrocks.sql.ast.expression.Subquery;
@@ -863,8 +864,16 @@ public class RelationTransformer implements AstVisitorExtendInterface<LogicalPla
             LogicalCTEConsumeOperator consume = new LogicalCTEConsumeOperator(cteId, mapBuilder.build());
             consumeBuilder = new OptExprBuilder(consume, List.of(), new ExpressionMapping(node.getScope(), outputColumns, null));
         } else {
-            // Leave the optimizer to decide later whether to materialize or inline
-            LogicalPlan childPlan = transform(node.getCteQueryStatement().getQueryRelation());
+            // Leave the optimizer to decide later whether to materialize or inline.
+            // Each consumer re-transforms the shared CTE body; give it a private lambda-arg scope
+            // so the shared LambdaArgument nodes don't collapse to one id across copies.
+            Map<LambdaArgument, ColumnRefOperator> savedLambdaScope = columnRefFactory.pushLambdaArgScope();
+            LogicalPlan childPlan;
+            try {
+                childPlan = transform(node.getCteQueryStatement().getQueryRelation());
+            } finally {
+                columnRefFactory.popLambdaArgScope(savedLambdaScope);
+            }
             Map<ColumnRefOperator, ColumnRefOperator> cteOutputColumnRefMap = checkCtePlanOutput(cteId, childPlan, node);
             LogicalCTEConsumeOperator consume = new LogicalCTEConsumeOperator(cteId, cteOutputColumnRefMap);
             consumeBuilder = new OptExprBuilder(consume, Lists.newArrayList(childPlan.getRootBuilder()),

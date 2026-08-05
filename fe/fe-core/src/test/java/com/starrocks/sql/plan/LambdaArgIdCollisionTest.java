@@ -33,7 +33,9 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -121,6 +123,76 @@ public class LambdaArgIdCollisionTest extends PlanTestNoneDBBase {
                         ref.getName() + " should stay VARCHAR but is " + ref.getType()
                                 + " — lambda arg id collision corrupted its type.");
             }
+        }
+    }
+
+    // A CTE containing an array_map, referenced by both arms of a UNION ALL. Each consumer
+    // re-transforms the SAME CTE AST, sharing its LambdaArgument nodes. Without a per-consumer
+    // lambda-arg scope the two array_map copies collapse onto one lambda-argument id (while every
+    // other column is freshly allocated), which later collides in id-keyed machinery such as the
+    // array_map global-dict pseudo columns -> BE "couldn't found dict cid".
+    @Test
+    public void testCteArrayMapInTwoUnionArmsGetsDistinctLambdaIds() throws Exception {
+        String sql = "WITH base AS (\n" +
+                "    SELECT transaction_uuid,\n" +
+                "           array_map(x -> x.value, request_attributes) AS vals\n" +
+                "    FROM conn_event\n" +
+                ")\n" +
+                "SELECT transaction_uuid, vals FROM base\n" +
+                "UNION ALL\n" +
+                "SELECT transaction_uuid, vals FROM base";
+
+        StatementBase statement = SqlParser.parse(sql,
+                connectContext.getSessionVariable().getSqlMode()).get(0);
+        Analyzer.analyze(statement, connectContext);
+        QueryStatement query = (QueryStatement) statement;
+
+        LogicalPlan plan = new RelationTransformer(new ColumnRefFactory(), connectContext)
+                .transform(query.getQueryRelation());
+
+        Set<LambdaFunctionOperator> lambdas = Collections.newSetFromMap(new IdentityHashMap<>());
+        collectLambdas(plan.getRoot(), lambdas);
+        Assertions.assertTrue(lambdas.size() >= 2,
+                "expected the CTE array_map to be duplicated into both UNION arms, found " + lambdas.size());
+
+        // No lambda-argument id may be owned by two distinct array_map copies.
+        Map<Integer, LambdaFunctionOperator> owner = new HashMap<>();
+        for (LambdaFunctionOperator lambda : lambdas) {
+            for (ColumnRefOperator arg : lambda.getRefColumns()) {
+                LambdaFunctionOperator prev = owner.putIfAbsent(arg.getId(), lambda);
+                Assertions.assertNull(prev,
+                        "lambda-argument id " + arg.getId() + " is shared by two array_map copies "
+                                + "(CTE consumers did not get independent lambda-arg scopes)");
+            }
+        }
+    }
+
+    private static void collectLambdas(OptExpression expr, Set<LambdaFunctionOperator> out) {
+        if (expr.getOp() instanceof LogicalProjectOperator) {
+            for (ScalarOperator s : ((LogicalProjectOperator) expr.getOp()).getColumnRefMap().values()) {
+                collectLambdas(s, out);
+            }
+        }
+        if (expr.getOp().getProjection() != null) {
+            for (ScalarOperator s : expr.getOp().getProjection().getColumnRefMap().values()) {
+                collectLambdas(s, out);
+            }
+        }
+        collectLambdas(expr.getOp().getPredicate(), out);
+        for (OptExpression child : expr.getInputs()) {
+            collectLambdas(child, out);
+        }
+    }
+
+    private static void collectLambdas(ScalarOperator s, Set<LambdaFunctionOperator> out) {
+        if (s == null) {
+            return;
+        }
+        if (s instanceof LambdaFunctionOperator) {
+            out.add((LambdaFunctionOperator) s);
+        }
+        for (ScalarOperator child : s.getChildren()) {
+            collectLambdas(child, out);
         }
     }
 
